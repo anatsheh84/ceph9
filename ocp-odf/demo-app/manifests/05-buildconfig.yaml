@@ -12,9 +12,12 @@ spec:
   source:
     type: Git
     git:
-      uri: https://github.com/REPLACE_ME/REPLACE_ME.git
+      uri: https://github.com/anatsheh84/ceph9.git
       ref: main
     contextDir: ocp-odf/demo-app
+    # private repo → in-cluster build authenticates with this secret
+    sourceSecret:
+      name: github-source-secret
   strategy:
     type: Docker
     dockerStrategy:
@@ -23,5 +26,5 @@ spec:
     to:
       kind: ImageStreamTag
       name: ceph-demo-app:latest
-  triggers:
-    - type: ConfigChange
+  # No auto-triggers — deploy.sh starts the build explicitly (after the git
+  # source secret exists), so the first build can't race ahead of its creds.
