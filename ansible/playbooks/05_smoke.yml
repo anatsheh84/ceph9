@@ -1,0 +1,7 @@
+---
+- name: Run RBD / CephFS / NFS / S3 smoke tests
+  hosts: admin
+  become: true
+  gather_facts: false
+  roles:
+    - smoke_tests

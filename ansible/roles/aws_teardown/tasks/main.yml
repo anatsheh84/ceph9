@@ -1,0 +1,195 @@
+---
+# Strict-order AWS teardown via aws CLI. Idempotent — missing resources are
+# silently OK.
+
+- name: Terminate all project instances
+  ansible.builtin.shell: |
+    IDS=$(aws ec2 describe-instances --region {{ aws_region }} \
+      --filters "Name=tag:Project,Values={{ project_tag }}" \
+                "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+      --query 'Reservations[].Instances[].InstanceId' --output text)
+    if [ -n "$IDS" ]; then
+      aws ec2 terminate-instances --instance-ids $IDS --region {{ aws_region }} >/dev/null
+      aws ec2 wait instance-terminated --instance-ids $IDS --region {{ aws_region }}
+      echo TERMINATED
+    else
+      echo NO_INSTANCES
+    fi
+  register: term_out
+  changed_when: "'TERMINATED' in term_out.stdout"
+
+- name: Find NAT gateways
+  ansible.builtin.shell: |
+    aws ec2 describe-nat-gateways --region {{ aws_region }} \
+      --filter "Name=tag:Name,Values={{ project_tag }}-nat" \
+               "Name=state,Values=available,pending" \
+      --query 'NatGateways[].NatGatewayId' --output text
+  register: natgw_ids
+  changed_when: false
+
+- name: Delete NAT gateways
+  ansible.builtin.shell: |
+    for n in {{ natgw_ids.stdout }}; do
+      aws ec2 delete-nat-gateway --nat-gateway-id $n --region {{ aws_region }} >/dev/null
+    done
+    for n in {{ natgw_ids.stdout }}; do
+      while true; do
+        STATE=$(aws ec2 describe-nat-gateways --nat-gateway-ids $n --region {{ aws_region }} --query 'NatGateways[0].State' --output text 2>/dev/null || echo deleted)
+        [ "$STATE" = "deleted" ] && break
+        sleep 10
+      done
+    done
+    echo DELETED
+  when: natgw_ids.stdout | length > 0
+  changed_when: true
+
+- name: Release Elastic IPs tagged for this project
+  ansible.builtin.shell: |
+    for a in $(aws ec2 describe-addresses --region {{ aws_region }} \
+        --filters "Name=tag:Name,Values={{ project_tag }}-nat-eip" \
+        --query 'Addresses[].AllocationId' --output text); do
+      aws ec2 release-address --allocation-id $a --region {{ aws_region }} >/dev/null && echo released $a
+    done
+  register: eip_out
+  changed_when: "'released' in eip_out.stdout"
+
+- name: Find route tables (non-main) and disassociate + delete
+  ansible.builtin.shell: |
+    VPC=$(aws ec2 describe-vpcs --region {{ aws_region }} \
+      --filters "Name=tag:Name,Values={{ project_tag }}-vpc" \
+      --query 'Vpcs[0].VpcId' --output text)
+    [ "$VPC" = "None" ] && { echo NO_VPC; exit 0; }
+    for rtb in $(aws ec2 describe-route-tables --region {{ aws_region }} \
+        --filters "Name=vpc-id,Values=$VPC" \
+        --query 'RouteTables[?Associations==`null` || not_null(Associations[0].Main) == `false`].RouteTableId' --output text); do
+      MAIN=$(aws ec2 describe-route-tables --route-table-ids $rtb --region {{ aws_region }} \
+        --query 'RouteTables[0].Associations[?Main==`true`]' --output text)
+      [ -n "$MAIN" ] && continue
+      for a in $(aws ec2 describe-route-tables --route-table-ids $rtb --region {{ aws_region }} \
+          --query 'RouteTables[0].Associations[].RouteTableAssociationId' --output text); do
+        aws ec2 disassociate-route-table --association-id $a --region {{ aws_region }} >/dev/null
+      done
+      aws ec2 delete-route-table --route-table-id $rtb --region {{ aws_region }} 2>&1 || true
+    done
+    echo OK
+  changed_when: false
+
+- name: Detach + delete IGW
+  ansible.builtin.shell: |
+    VPC=$(aws ec2 describe-vpcs --region {{ aws_region }} \
+      --filters "Name=tag:Name,Values={{ project_tag }}-vpc" \
+      --query 'Vpcs[0].VpcId' --output text)
+    [ "$VPC" = "None" ] && { echo NO_VPC; exit 0; }
+    IGW=$(aws ec2 describe-internet-gateways --region {{ aws_region }} \
+      --filters "Name=attachment.vpc-id,Values=$VPC" \
+      --query 'InternetGateways[0].InternetGatewayId' --output text)
+    [ "$IGW" = "None" ] && { echo NO_IGW; exit 0; }
+    aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC --region {{ aws_region }} || true
+    aws ec2 delete-internet-gateway --internet-gateway-id $IGW --region {{ aws_region }} || true
+    echo DELETED
+  register: igw_out
+  changed_when: "'DELETED' in igw_out.stdout"
+
+- name: Delete subnets
+  ansible.builtin.shell: |
+    VPC=$(aws ec2 describe-vpcs --region {{ aws_region }} \
+      --filters "Name=tag:Name,Values={{ project_tag }}-vpc" \
+      --query 'Vpcs[0].VpcId' --output text)
+    [ "$VPC" = "None" ] && { echo NO_VPC; exit 0; }
+    for s in $(aws ec2 describe-subnets --region {{ aws_region }} \
+        --filters "Name=vpc-id,Values=$VPC" \
+        --query 'Subnets[].SubnetId' --output text); do
+      aws ec2 delete-subnet --subnet-id $s --region {{ aws_region }} 2>&1 || true
+    done
+    echo OK
+  changed_when: false
+
+- name: Delete security group
+  ansible.builtin.shell: |
+    SG=$(aws ec2 describe-security-groups --region {{ aws_region }} \
+      --filters "Name=group-name,Values={{ project_tag }}-sg" \
+      --query 'SecurityGroups[0].GroupId' --output text)
+    [ "$SG" = "None" ] && { echo NO_SG; exit 0; }
+    aws ec2 delete-security-group --group-id $SG --region {{ aws_region }} 2>&1 || true
+    echo DELETED
+  register: sg_out
+  changed_when: "'DELETED' in sg_out.stdout"
+
+- name: Delete placement group
+  ansible.builtin.shell: |
+    aws ec2 delete-placement-group --group-name {{ project_tag }}-cluster --region {{ aws_region }} 2>&1 || true
+    echo OK
+  changed_when: false
+
+- name: Delete VPC
+  ansible.builtin.shell: |
+    VPC=$(aws ec2 describe-vpcs --region {{ aws_region }} \
+      --filters "Name=tag:Name,Values={{ project_tag }}-vpc" \
+      --query 'Vpcs[0].VpcId' --output text)
+    [ "$VPC" = "None" ] && { echo NO_VPC; exit 0; }
+    aws ec2 delete-vpc --vpc-id $VPC --region {{ aws_region }} 2>&1 || true
+    echo DELETED
+  register: vpc_out
+  changed_when: "'DELETED' in vpc_out.stdout"
+
+- name: Delete keypair
+  ansible.builtin.shell: |
+    aws ec2 delete-key-pair --key-name {{ keypair_name }} --region {{ aws_region }} 2>&1 || true
+    rm -f {{ key_local_path }}
+    echo OK
+  changed_when: false
+
+- name: Delete Route 53 records (best-effort)
+  ansible.builtin.shell: |
+    set -e
+    DOMAIN="{{ route53_domain }}"
+    ZONE="{{ route53_zone_id }}"
+    [ -z "$DOMAIN" ] && { echo NO_DNS; exit 0; }
+    [ -z "$ZONE" ]   && { echo NO_DNS; exit 0; }
+    CHANGES="["
+    FIRST=1
+    for n in bastion ceph01 ceph02 ceph03 ceph04 dashboard s3; do
+      VAL=$(aws route53 list-resource-record-sets --hosted-zone-id $ZONE \
+        --query "ResourceRecordSets[?Name=='$n.$DOMAIN.'].ResourceRecords[0].Value" --output text)
+      [ -z "$VAL" ] || [ "$VAL" = "None" ] && continue
+      [ $FIRST -eq 1 ] || CHANGES="$CHANGES,"
+      FIRST=0
+      CHANGES="$CHANGES{\"Action\":\"DELETE\",\"ResourceRecordSet\":{\"Name\":\"$n.$DOMAIN\",\"Type\":\"A\",\"TTL\":60,\"ResourceRecords\":[{\"Value\":\"$VAL\"}]}}"
+    done
+    CHANGES="$CHANGES]"
+    if [ "$CHANGES" != "[]" ]; then
+      printf '{"Changes":%s}' "$CHANGES" > /tmp/r53-del.json
+      aws route53 change-resource-record-sets --hosted-zone-id $ZONE --change-batch file:///tmp/r53-del.json --query 'ChangeInfo.Status' --output text
+    fi
+    echo DONE
+  changed_when: false
+
+# Read the bastion's last public IP (best-effort) BEFORE deleting the summary,
+# so we can scrub its host key too.
+- name: Read provisioning summary for bastion IP (best-effort)
+  ansible.builtin.slurp:
+    src: "{{ playbook_dir }}/../.provisioned.json"
+  register: prov_slurp
+  failed_when: false
+
+# Leave a clean slate: drop this lab's host keys so the next build doesn't hit
+# "REMOTE HOST IDENTIFICATION HAS CHANGED". The fixed ceph IPs always collide;
+# the bastion IP is scrubbed too when the summary is available.
+- name: Clear this lab's SSH host keys from known_hosts
+  ansible.builtin.shell: |
+    KH="{{ known_hosts_file }}"
+    [ -f "$KH" ] || exit 0
+    HOSTS="{{ ceph_nodes | map(attribute='ip') | join(' ') }}"
+    {% if prov_slurp.content is defined %}
+    HOSTS="$HOSTS {{ (prov_slurp.content | b64decode | from_json).bastion_public_ip | default('') }}"
+    {% endif %}
+    for h in $HOSTS; do
+      [ -n "$h" ] && ssh-keygen -R "$h" -f "$KH" >/dev/null 2>&1 || true
+    done
+  delegate_to: localhost
+  changed_when: false
+
+- name: Remove provisioning summary
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/../.provisioned.json"
+    state: absent

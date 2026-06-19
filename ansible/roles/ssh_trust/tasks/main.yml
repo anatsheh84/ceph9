@@ -1,0 +1,47 @@
+---
+# Set short hostnames, write /etc/hosts, and establish passwordless SSH
+# between the admin node (ceph01) and the other ceph nodes (also self).
+
+- name: Set short hostname
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Write static /etc/hosts entries for the cluster
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} ANSIBLE MANAGED CEPH9"
+    block: |
+      {% for n in ceph_nodes %}
+      {{ n.ip }} {{ n.name }} {{ n.name }}.{{ route53_domain | default('local','true') }}
+      {% endfor %}
+
+# ----- Key generation (admin only) -------------------------------------------
+- name: Generate cluster SSH key on the admin node
+  community.crypto.openssh_keypair:
+    path: /home/ec2-user/.ssh/id_ed25519
+    type: ed25519
+    owner: ec2-user
+    group: ec2-user
+    mode: '0600'
+    state: present
+  become_user: ec2-user
+  when: "'admin' in group_names"
+  register: admin_key
+
+- name: Fetch admin pubkey
+  ansible.builtin.slurp:
+    src: /home/ec2-user/.ssh/id_ed25519.pub
+  register: admin_pub_slurp
+  when: "'admin' in group_names"
+
+- name: Stash admin pubkey as a fact
+  ansible.builtin.set_fact:
+    admin_ssh_pub: "{{ admin_pub_slurp.content | b64decode | trim }}"
+  when: "'admin' in group_names"
+
+- name: Distribute admin pubkey to every ceph node (including self)
+  ansible.posix.authorized_key:
+    user: ec2-user
+    key: "{{ hostvars[groups['admin'][0]].admin_ssh_pub }}"
+    state: present
+  when: hostvars[groups['admin'][0]].admin_ssh_pub is defined

@@ -1,0 +1,9 @@
+---
+# End-to-end. Run with:
+#   RH_USER=user@redhat.com RH_PASS='...' ansible-playbook playbooks/site.yml
+- ansible.builtin.import_playbook: 00_provision_aws.yml
+- ansible.builtin.import_playbook: 01_prepare_hosts.yml
+- ansible.builtin.import_playbook: 02_bootstrap.yml
+- ansible.builtin.import_playbook: 03_cluster.yml
+- ansible.builtin.import_playbook: 04_services.yml
+- ansible.builtin.import_playbook: 05_smoke.yml

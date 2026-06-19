@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# ceph9-access — one-stop access helper for the Ceph 9 lab.
+#
+# Run this on your laptop AFTER `ansible-playbook playbooks/05_smoke.yml`
+# (or after `playbooks/site.yml`).
+#
+# It will:
+#   1) write a /etc/hosts block on the bastion so port-forwards resolve ceph01..04
+#   2) fetch the dashboard bootstrap password and S3 lab-user keys
+#   3) print URL + credentials cheat-sheet
+#   4) open SSH tunnels: 8443 (Dashboard), 3000 (Grafana), 8080 (S3), 2049 (NFS)
+#
+# Usage:
+#   ceph9-access                # full flow: configure + fetch + print + open all tunnels (foreground)
+#   ceph9-access dashboard      # only the dashboard tunnel
+#   ceph9-access grafana|s3|nfs # individual targets
+#   ceph9-access --info         # just print URL + credentials, no tunnel
+#   ceph9-access --status       # what's tunneled right now
+#   ceph9-access --stop         # stop the script-managed tunnel
+#
+# Portable: tested with bash 3.2 (macOS default) and bash 5+.
+
+set -eu
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROV="${REPO_ROOT}/.provisioned.json"
+KEY="${KEY:-$HOME/.ssh/ceph9-lab.pem}"
+KNOWN_HOSTS="${HOME}/.ssh/ceph9-known_hosts"
+PIDFILE="/tmp/ceph9-tunnel.pid"
+LOGFILE="/tmp/ceph9-tunnel.log"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+[ -f "$KEY" ] || die "SSH key not found at ${KEY}. Set KEY=/path/to/key.pem to override."
+
+bastion_ip() {
+  [ -f "$PROV" ] || die "${PROV} not found. Run 'ansible-playbook playbooks/00_provision_aws.yml' first."
+  python3 -c "import json; print(json.load(open('${PROV}'))['bastion_public_ip'])"
+}
+
+# ssh to bastion (direct)
+ssh_bastion() {
+  local bast="$1"; shift
+  ssh -i "$KEY" \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile="$KNOWN_HOSTS" \
+      -o BatchMode=yes \
+      -o ServerAliveInterval=30 \
+      "ec2-user@${bast}" "$@"
+}
+
+# ssh to a ceph node *through* the bastion (constructs a proper ProxyCommand)
+ssh_ceph() {
+  local bast="$1"; local node_ip="$2"; shift 2
+  local proxy_cmd="ssh -W %h:%p -i ${KEY} -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${KNOWN_HOSTS} -o BatchMode=yes ec2-user@${bast}"
+  ssh -i "$KEY" \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile="$KNOWN_HOSTS" \
+      -o BatchMode=yes \
+      -o ServerAliveInterval=30 \
+      -o "ProxyCommand=${proxy_cmd}" \
+      "ec2-user@${node_ip}" "$@"
+}
+
+# ---------- service catalog (no associative arrays — bash 3.2 compatible) ---
+# format: "key|forward-spec|hint"
+SERVICES_CATALOG="\
+dashboard|8443:10.20.2.11:8443|Dashboard (Ceph mgr)
+grafana|3000:10.20.2.11:3000|Grafana
+s3|8080:10.20.2.12:8080|RGW S3 endpoint
+nfs|2049:10.20.2.13:2049|NFS-Ganesha"
+
+select_forwards() {
+  local want="$1"
+  echo "$SERVICES_CATALOG" | while IFS='|' read -r key spec hint; do
+    if [ "$want" = "all" ] || [ "$want" = "$key" ]; then
+      printf '%s\n' "$spec"
+    fi
+  done
+}
+
+print_selected_services() {
+  local want="$1"
+  echo "$SERVICES_CATALOG" | while IFS='|' read -r key spec hint; do
+    if [ "$want" = "all" ] || [ "$want" = "$key" ]; then
+      port=${spec%%:*}
+      printf "  %-9s localhost:%s  ← %s\n" "$key" "$port" "$hint"
+    fi
+  done
+}
+
+ensure_bastion_hosts_file() {
+  local bast="$1"
+  echo "configuring /etc/hosts on bastion..."
+  ssh_bastion "$bast" '
+    set -e
+    sudo sed -i.bak "/# BEGIN CEPH9/,/# END CEPH9/d" /etc/hosts
+    sudo tee -a /etc/hosts >/dev/null <<HOSTS
+# BEGIN CEPH9
+10.20.2.11 ceph01 ceph01.sandbox1580.opentlc.com
+10.20.2.12 ceph02 ceph02.sandbox1580.opentlc.com
+10.20.2.13 ceph03 ceph03.sandbox1580.opentlc.com
+10.20.2.14 ceph04 ceph04.sandbox1580.opentlc.com
+# END CEPH9
+HOSTS
+  '
+  echo "  ok"
+}
+
+fetch_credentials() {
+  local bast="$1"
+  echo "fetching dashboard password and S3 keys (via bastion)..."
+
+  DASH_PW=$(ssh_ceph "$bast" 10.20.2.11 \
+    "sudo grep -oE 'Password: [A-Za-z0-9]+' /var/log/ceph/cephadm.log 2>/dev/null | tail -1 | awk '{print \$2}'" \
+    2>/dev/null || true)
+  [ -z "$DASH_PW" ] && DASH_PW="(check /var/log/ceph/cephadm.log on ceph01)"
+
+  LABUSER_JSON=$(ssh_ceph "$bast" 10.20.2.11 '
+    if sudo /usr/sbin/cephadm shell -- radosgw-admin user info --uid=labuser --format=json 2>/dev/null > /tmp/labuser.json; then :;
+    else sudo /usr/sbin/cephadm shell -- radosgw-admin user create --uid=labuser --display-name="Lab User" --email=lab@example.com --format=json 2>/dev/null > /tmp/labuser.json; fi
+    cat /tmp/labuser.json
+  ' 2>/dev/null || true)
+
+  S3_AK=$(printf '%s\n' "$LABUSER_JSON" | python3 -c "import json,re,sys; m=re.search(r'\{.*\}',sys.stdin.read(),re.S); print(json.loads(m.group(0))['keys'][0]['access_key'])" 2>/dev/null || echo "")
+  S3_SK=$(printf '%s\n' "$LABUSER_JSON" | python3 -c "import json,re,sys; m=re.search(r'\{.*\}',sys.stdin.read(),re.S); print(json.loads(m.group(0))['keys'][0]['secret_key'])" 2>/dev/null || echo "")
+
+  FSID=$(ssh_ceph "$bast" 10.20.2.11 "sudo /usr/sbin/cephadm shell -- ceph fsid 2>/dev/null" 2>/dev/null | tr -d '\r' || echo "unknown")
+  HEALTH=$(ssh_ceph "$bast" 10.20.2.11 "sudo /usr/sbin/cephadm shell -- ceph health 2>/dev/null" 2>/dev/null | tr -d '\r' || echo "unknown")
+}
+
+print_cheat_sheet() {
+  local bast="$1"
+  cat <<EOF
+
+======================================================================
+  CEPH 9 LAB — ACCESS CHEAT-SHEET
+======================================================================
+  Cluster fsid : ${FSID}
+  Health       : ${HEALTH}
+  Bastion      : ${bast}
+  SSH key      : ${KEY}
+
+----------------------------------------------------------------------
+  ▶ OPEN IN BROWSER
+----------------------------------------------------------------------
+  Dashboard :  https://localhost:8443/    (admin / ${DASH_PW})
+  Grafana   :  http://localhost:3000/     (admin / ${DASH_PW})
+
+  Note: Ceph forces a password change on first dashboard login.
+
+----------------------------------------------------------------------
+  ▶ S3 (RGW) endpoint  →  http://localhost:8080
+----------------------------------------------------------------------
+  Access key : ${S3_AK}
+  Secret key : ${S3_SK}
+
+  Quick test:
+    aws configure set aws_access_key_id     ${S3_AK} --profile ceph
+    aws configure set aws_secret_access_key ${S3_SK} --profile ceph
+    AWS_EC2_METADATA_DISABLED=true AWS_DEFAULT_REGION=us-east-1 \\
+      aws --profile ceph --endpoint-url http://localhost:8080 s3 ls
+
+----------------------------------------------------------------------
+  ▶ NFS export (CephFS)
+----------------------------------------------------------------------
+  Mount: sudo mount -t nfs4 localhost:/cephfs /mnt/nfs
+
+======================================================================
+EOF
+}
+
+stop_tunnel() {
+  if [ -f "$PIDFILE" ]; then
+    pid=$(cat "$PIDFILE")
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "stopping tunnel pid $pid"
+      kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE"
+  fi
+}
+
+status() {
+  echo "Local listening sockets on 3000/8080/8443/2049:"
+  lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null \
+    | awk '/[: ](3000|8080|8443|2049)[ ]/{print "  "$0}' | sed -n '1,12p' || echo "  (none)"
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "Active tunnel pid: $(cat "$PIDFILE")  (log: $LOGFILE)"
+  else
+    echo "No tunnel managed by this script."
+  fi
+}
+
+open_tunnel() {
+  local want="$1"; local bast="$2"
+  stop_tunnel
+
+  LARGS=""
+  for spec in $(select_forwards "$want"); do
+    LARGS="$LARGS -L $spec"
+  done
+  [ -z "$LARGS" ] && die "no forwards selected"
+
+  echo
+  echo "opening tunnels:"
+  print_selected_services "$want"
+  echo
+
+  ( ssh -i "$KEY" \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="$KNOWN_HOSTS" \
+        -o ServerAliveInterval=30 \
+        -o ExitOnForwardFailure=yes \
+        -N -T $LARGS "ec2-user@${bast}" 2> "$LOGFILE" ) &
+  PID=$!
+  echo $PID > "$PIDFILE"
+
+  sleep 2
+  LISTENING=0
+  for spec in $(select_forwards "$want"); do
+    port=${spec%%:*}
+    if lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1; then
+      LISTENING=$((LISTENING + 1))
+    fi
+  done
+
+  if [ "$LISTENING" -eq 0 ]; then
+    echo "error: tunnel did not establish — see $LOGFILE" >&2
+    cat "$LOGFILE" >&2 || true
+    stop_tunnel
+    exit 1
+  fi
+
+  echo "tunnel ready — Ctrl-C to stop."
+  wait $PID
+}
+
+# ---------- main ------------------------------------------------------------
+WHAT="${1:-all}"
+case "$WHAT" in
+  --status|-s|status) status; exit 0 ;;
+  --stop|stop)        stop_tunnel; echo "stopped"; exit 0 ;;
+  --help|-h)
+    sed -n '2,20p' "$0"
+    exit 0
+    ;;
+  --info|info)
+    BAST=$(bastion_ip)
+    echo "bastion: ${BAST}"
+    fetch_credentials "$BAST"
+    print_cheat_sheet "$BAST"
+    exit 0
+    ;;
+  all|dashboard|grafana|s3|nfs) : ;;
+  *)
+    die "unknown target: $WHAT  (expected: all|dashboard|grafana|s3|nfs|--info|--status|--stop)"
+    ;;
+esac
+
+BAST=$(bastion_ip)
+echo "bastion: ${BAST}"
+
+ensure_bastion_hosts_file "$BAST"
+fetch_credentials "$BAST"
+print_cheat_sheet "$BAST"
+
+open_tunnel "$WHAT" "$BAST"

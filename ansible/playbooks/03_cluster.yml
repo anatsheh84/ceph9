@@ -1,0 +1,7 @@
+---
+- name: Distribute cluster pubkey + add hosts + labels + OSDs
+  hosts: ceph
+  become: true
+  gather_facts: false
+  roles:
+    - ceph_cluster

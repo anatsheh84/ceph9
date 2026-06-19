@@ -1,0 +1,43 @@
+---
+# Register with RHSM, fix the RHEL-AMI manage_repos=0 default,
+# enable required repos, dnf update, reboot if needed.
+
+- name: Register system with Red Hat (subscription-manager)
+  community.general.redhat_subscription:
+    state: present
+    username: "{{ rh_username }}"
+    password: "{{ rh_password }}"
+    auto_attach: false      # SCA — no entitlement needed
+  no_log: true
+
+# >>> Lesson learned: Red Hat AMIs ship with manage_repos=0 which silently
+# >>> swallows `repos --enable=...` and you get "Repositories disabled by
+# >>> configuration." instead of the repos being enabled.
+- name: Force subscription-manager to manage /etc/yum.repos.d/redhat.repo
+  ansible.builtin.command:
+    cmd: subscription-manager config --rhsm.manage_repos=1
+  changed_when: false
+
+- name: Disable all repos first
+  community.general.rhsm_repository:
+    name: "*"
+    state: disabled
+
+- name: Enable required repos
+  community.general.rhsm_repository:
+    name: "{{ rhel_repos }}"
+    state: enabled
+
+- name: Upgrade packages to latest
+  ansible.builtin.dnf:
+    name: '*'
+    state: latest                # noqa package-latest
+    update_only: false
+  register: dnf_update
+
+- name: Reboot if a new kernel landed
+  ansible.builtin.reboot:
+    msg: "Rebooting after dnf update (Ansible)"
+    pre_reboot_delay: 5
+    reboot_timeout: 600
+  when: dnf_update.changed

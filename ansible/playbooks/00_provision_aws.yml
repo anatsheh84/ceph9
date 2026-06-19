@@ -1,0 +1,7 @@
+---
+- name: Provision AWS infrastructure for Ceph 9
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  roles:
+    - aws_infra

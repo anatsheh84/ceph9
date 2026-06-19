@@ -1,0 +1,43 @@
+apiVersion: v1
+baseDomain: ${BASE_DOMAIN}
+metadata:
+  name: ${CLUSTER_NAME}
+controlPlane:
+  architecture: amd64
+  hyperthreading: Enabled
+  name: master
+  platform:
+    aws:
+      type: ${CONTROL_PLANE_TYPE}
+      rootVolume:
+        size: 120
+        type: gp3
+        iops: 3000
+  replicas: 3
+compute:
+  - architecture: amd64
+    hyperthreading: Enabled
+    name: worker
+    platform:
+      aws:
+        type: ${WORKER_TYPE}
+        rootVolume:
+          size: 120
+          type: gp3
+          iops: 3000
+    replicas: ${WORKER_REPLICAS}
+networking:
+  clusterNetwork:
+    - cidr: ${CLUSTER_CIDR}
+      hostPrefix: 23
+  machineNetwork:
+    - cidr: ${MACHINE_CIDR}
+  networkType: OVNKubernetes
+  serviceNetwork:
+    - ${SERVICE_CIDR}
+platform:
+  aws:
+    region: ${REGION}
+publish: External
+pullSecret: '${PULL_SECRET_JSON}'
+sshKey: '${SSH_PUBLIC_KEY}'

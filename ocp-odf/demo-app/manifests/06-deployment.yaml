@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ceph-demo-app
+  namespace: ceph-demo
+  labels:
+    app: ceph-demo-app
+  annotations:
+    # Redeploy automatically when the build pushes a new image.
+    image.openshift.io/triggers: |
+      [{"from":{"kind":"ImageStreamTag","name":"ceph-demo-app:latest","namespace":"ceph-demo"},
+        "fieldPath":"spec.template.spec.containers[?(@.name==\"app\")].image"}]
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ceph-demo-app
+  template:
+    metadata:
+      labels:
+        app: ceph-demo-app
+    spec:
+      containers:
+        - name: app
+          # Patched by the image trigger to the built image digest.
+          image: image-registry.openshift-image-registry.svc:5000/ceph-demo/ceph-demo-app:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: BLOCK_DIR
+              value: /data/block
+            - name: FILE_DIR
+              value: /data/file
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          envFrom:
+            # Object bucket details + credentials from the OBC.
+            - configMapRef:
+                name: ceph-demo-bucket
+                optional: true
+            - secretRef:
+                name: ceph-demo-bucket
+                optional: true
+          volumeMounts:
+            - name: block
+              mountPath: /data/block
+            - name: file
+              mountPath: /data/file
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 512Mi }
+      volumes:
+        - name: block
+          persistentVolumeClaim:
+            claimName: ceph-demo-block
+        - name: file
+          persistentVolumeClaim:
+            claimName: ceph-demo-file

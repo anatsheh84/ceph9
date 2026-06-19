@@ -1,0 +1,8 @@
+# Real credentials — never commit
+env.sh
+
+# openshift-install state (kubeconfig, metadata.json, logs, terraform state)
+clusters/
+
+# rendered external-mode connection details (contains keyrings)
+*.external-details.json

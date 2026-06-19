@@ -1,0 +1,65 @@
+---
+# Distribute the cluster pubkey to ceph02-04 (ec2-user) so cephadm can SSH,
+# then add the hosts and apply labels and MON/MGR placement specs.
+
+# This runs ONCE on the admin node, against an in-memory list of targets.
+
+- name: Push /etc/ceph/ceph.pub into ec2-user's authorized_keys on every ceph node
+  ansible.posix.authorized_key:
+    user: ec2-user
+    key: "{{ hostvars[groups['admin'][0]].cluster_ssh_pub }}"
+    state: present
+  when: hostvars[groups['admin'][0]].cluster_ssh_pub is defined
+
+- name: Admin-only block — orchestrator operations
+  when: "'admin' in group_names"
+  block:
+
+    - name: Add ceph02-04 to the cluster
+      ansible.builtin.command:
+        cmd: /usr/sbin/cephadm shell -- ceph orch host add {{ item.name }} {{ item.ip }}
+      loop: "{{ ceph_nodes | rejectattr('name','==','ceph01') | list }}"
+      register: host_add
+      changed_when: "'Added' in host_add.stdout"
+      failed_when:
+        - host_add.rc != 0
+        - "'already part of' not in host_add.stderr"
+        - "'already' not in host_add.stdout"
+
+    - name: Apply host labels
+      ansible.builtin.command:
+        cmd: /usr/sbin/cephadm shell -- ceph orch host label add {{ item.0.name }} {{ item.1 }}
+      loop: "{{ ceph_nodes | subelements('labels') }}"
+      register: lbl
+      changed_when: "'Added label' in lbl.stdout"
+      failed_when:
+        - lbl.rc != 0
+        - "'already' not in lbl.stdout"
+        - "'already' not in lbl.stderr"
+
+    - name: Pin MON placement
+      ansible.builtin.command:
+        cmd: /usr/sbin/cephadm shell -- ceph orch apply mon --placement=label:mon
+      changed_when: false
+
+    - name: Pin MGR placement
+      ansible.builtin.command:
+        cmd: /usr/sbin/cephadm shell -- ceph orch apply mgr --placement=label:mgr
+      changed_when: false
+
+    - name: Deploy OSDs on every available device
+      ansible.builtin.command:
+        cmd: /usr/sbin/cephadm shell -- ceph orch apply osd --all-available-devices
+      changed_when: false
+
+    - name: Wait for all OSDs to come up
+      ansible.builtin.shell: |
+        set -o pipefail
+        cephadm shell -- ceph -s 2>/dev/null \
+          | grep -oE '[0-9]+ osds: [0-9]+ up' \
+          | awk '{print $3}'
+      register: osd_up
+      until: (osd_up.stdout | int) == (ceph_nodes | length) * osd_disks_per_node
+      retries: 40
+      delay: 15
+      changed_when: false

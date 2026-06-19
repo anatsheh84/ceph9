@@ -1,0 +1,45 @@
+---
+# Bootstrap the cluster on the admin node and stash the cluster SSH key
+# so it can be distributed to the other ceph nodes.
+
+- name: Skip unless on admin
+  ansible.builtin.meta: end_play
+  when: "'admin' not in group_names"
+
+- name: Write registry-login JSON
+  ansible.builtin.copy:
+    dest: /etc/mylogin.json
+    mode: '0600'
+    content: |
+      {
+        "url": "registry.redhat.io",
+        "username": "{{ rh_username }}",
+        "password": "{{ rh_password }}"
+      }
+  no_log: true
+
+- name: Determine if cluster already bootstrapped
+  ansible.builtin.stat:
+    path: /etc/ceph/ceph.conf
+  register: ceph_conf
+
+- name: cephadm bootstrap
+  ansible.builtin.command:
+    cmd: >-
+      /usr/sbin/cephadm bootstrap
+      --ssh-user ec2-user
+      --mon-ip {{ ceph_nodes | selectattr('name','==','ceph01') | map(attribute='ip') | first }}
+      --cluster-network {{ private_subnet_cidr }}
+      --allow-fqdn-hostname
+      --registry-json /etc/mylogin.json
+  when: not ceph_conf.stat.exists
+  register: bootstrap
+
+- name: Fetch /etc/ceph/ceph.pub (cluster's SSH pubkey)
+  ansible.builtin.slurp:
+    src: /etc/ceph/ceph.pub
+  register: cluster_pub_slurp
+
+- name: Set ceph.pub as a fact
+  ansible.builtin.set_fact:
+    cluster_ssh_pub: "{{ cluster_pub_slurp.content | b64decode | trim }}"

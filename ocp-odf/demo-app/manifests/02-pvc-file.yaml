@@ -1,0 +1,12 @@
+# File endpoint — ReadWriteMany PVC on the external CephFS storageclass.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ceph-demo-file
+  namespace: ceph-demo
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ocs-external-storagecluster-cephfs
+  resources:
+    requests:
+      storage: 5Gi

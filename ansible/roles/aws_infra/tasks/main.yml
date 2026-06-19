@@ -1,0 +1,472 @@
+---
+# AWS infrastructure for the Ceph 9 lab — implemented via aws CLI.
+# Idempotent through tag-based lookups + grep-before-create. Auth is read
+# from AWS_* env vars on the controller (same contract as the OCP lab).
+
+- name: Ensure prerequisites are on the controller
+  ansible.builtin.shell: "command -v aws && command -v jq"
+  changed_when: false
+
+- name: Resolve admin CIDR (optional auto-detect)
+  ansible.builtin.shell: "curl -fsS --max-time 5 https://checkip.amazonaws.com | tr -d '[:space:]'"
+  register: admin_ip_lookup
+  changed_when: false
+  when: admin_cidr == "auto"
+  failed_when: false
+
+- name: Apply auto-detected admin CIDR
+  ansible.builtin.set_fact:
+    admin_cidr: "{{ admin_ip_lookup.stdout }}/32"
+  when:
+    - admin_cidr == "auto"
+    - admin_ip_lookup.stdout is defined
+    - admin_ip_lookup.stdout | length > 0
+
+# ----- Keypair --------------------------------------------------------------
+- name: Check if EC2 keypair already exists
+  ansible.builtin.shell: >
+    aws ec2 describe-key-pairs --key-names {{ keypair_name }} --region {{ aws_region }}
+    --query 'KeyPairs[0].KeyName' --output text 2>/dev/null || echo NONE
+  register: keypair_check
+  changed_when: false
+
+- name: Create EC2 keypair and save private key locally
+  ansible.builtin.shell: |
+    set -e
+    aws ec2 create-key-pair --key-name {{ keypair_name }} --key-type ed25519 \
+      --region {{ aws_region }} \
+      --query KeyMaterial --output text > {{ key_local_path }}
+    chmod 600 {{ key_local_path }}
+  when: keypair_check.stdout == 'NONE'
+
+# ----- VPC ------------------------------------------------------------------
+- name: Look up VPC by Name tag
+  ansible.builtin.shell: >
+    aws ec2 describe-vpcs --region {{ aws_region }}
+    --filters 'Name=tag:Name,Values={{ project_tag }}-vpc'
+    --query 'Vpcs[0].VpcId' --output text
+  register: vpc_lookup
+  changed_when: false
+
+- name: Create VPC if not present
+  ansible.builtin.shell: |
+    set -e
+    VPC=$(aws ec2 create-vpc --region {{ aws_region }} \
+      --cidr-block {{ vpc_cidr }} \
+      --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value={{ project_tag }}-vpc},{Key=Project,Value={{ project_tag }}}]' \
+      --query Vpc.VpcId --output text)
+    aws ec2 modify-vpc-attribute --vpc-id $VPC --enable-dns-hostnames --region {{ aws_region }}
+    aws ec2 modify-vpc-attribute --vpc-id $VPC --enable-dns-support --region {{ aws_region }}
+    echo $VPC
+  register: vpc_create
+  when: vpc_lookup.stdout in ['', 'None']
+
+- name: Set vpc_id fact
+  ansible.builtin.set_fact:
+    vpc_id: "{{ vpc_create.stdout if (vpc_lookup.stdout in ['','None']) else vpc_lookup.stdout }}"
+
+- name: Show vpc_id
+  ansible.builtin.debug: { var: vpc_id }
+
+# ----- Subnets --------------------------------------------------------------
+- name: Look up public subnet
+  ansible.builtin.shell: >
+    aws ec2 describe-subnets --region {{ aws_region }}
+    --filters 'Name=tag:Name,Values={{ project_tag }}-public'
+    'Name=vpc-id,Values={{ vpc_id }}'
+    --query 'Subnets[0].SubnetId' --output text
+  register: pub_subnet_lookup
+  changed_when: false
+
+- name: Create public subnet if not present
+  ansible.builtin.shell: |
+    set -e
+    SUB=$(aws ec2 create-subnet --vpc-id {{ vpc_id }} \
+      --cidr-block {{ public_subnet_cidr }} \
+      --availability-zone {{ aws_availability_zone }} \
+      --region {{ aws_region }} \
+      --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value={{ project_tag }}-public}]' \
+      --query Subnet.SubnetId --output text)
+    aws ec2 modify-subnet-attribute --subnet-id $SUB --map-public-ip-on-launch --region {{ aws_region }}
+    echo $SUB
+  register: pub_subnet_create
+  when: pub_subnet_lookup.stdout in ['', 'None']
+
+- name: Set public subnet fact
+  ansible.builtin.set_fact:
+    public_subnet_id: "{{ pub_subnet_create.stdout if (pub_subnet_lookup.stdout in ['','None']) else pub_subnet_lookup.stdout }}"
+
+- name: Look up private subnet
+  ansible.builtin.shell: >
+    aws ec2 describe-subnets --region {{ aws_region }}
+    --filters 'Name=tag:Name,Values={{ project_tag }}-private'
+    'Name=vpc-id,Values={{ vpc_id }}'
+    --query 'Subnets[0].SubnetId' --output text
+  register: priv_subnet_lookup
+  changed_when: false
+
+- name: Create private subnet if not present
+  ansible.builtin.shell: |
+    aws ec2 create-subnet --vpc-id {{ vpc_id }} \
+      --cidr-block {{ private_subnet_cidr }} \
+      --availability-zone {{ aws_availability_zone }} \
+      --region {{ aws_region }} \
+      --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value={{ project_tag }}-private}]' \
+      --query Subnet.SubnetId --output text
+  register: priv_subnet_create
+  when: priv_subnet_lookup.stdout in ['', 'None']
+
+- name: Set private subnet fact
+  ansible.builtin.set_fact:
+    private_subnet_id: "{{ priv_subnet_create.stdout if (priv_subnet_lookup.stdout in ['','None']) else priv_subnet_lookup.stdout }}"
+
+# ----- IGW + public route table --------------------------------------------
+- name: Look up IGW
+  ansible.builtin.shell: >
+    aws ec2 describe-internet-gateways --region {{ aws_region }}
+    --filters 'Name=tag:Name,Values={{ project_tag }}-igw'
+    --query 'InternetGateways[0].InternetGatewayId' --output text
+  register: igw_lookup
+  changed_when: false
+
+- name: Create + attach IGW
+  ansible.builtin.shell: |
+    set -e
+    IGW=$(aws ec2 create-internet-gateway --region {{ aws_region }} \
+      --tag-specifications 'ResourceType=internet-gateway,Tags=[{Key=Name,Value={{ project_tag }}-igw}]' \
+      --query InternetGateway.InternetGatewayId --output text)
+    aws ec2 attach-internet-gateway --internet-gateway-id $IGW --vpc-id {{ vpc_id }} --region {{ aws_region }}
+    echo $IGW
+  register: igw_create
+  when: igw_lookup.stdout in ['', 'None']
+
+- name: Set igw_id fact
+  ansible.builtin.set_fact:
+    igw_id: "{{ igw_create.stdout if (igw_lookup.stdout in ['','None']) else igw_lookup.stdout }}"
+
+- name: Look up public route table
+  ansible.builtin.shell: >
+    aws ec2 describe-route-tables --region {{ aws_region }}
+    --filters 'Name=tag:Name,Values={{ project_tag }}-public-rtb'
+    --query 'RouteTables[0].RouteTableId' --output text
+  register: pub_rtb_lookup
+  changed_when: false
+
+- name: Create public route table + route + association
+  ansible.builtin.shell: |
+    set -e
+    RTB=$(aws ec2 create-route-table --vpc-id {{ vpc_id }} --region {{ aws_region }} \
+      --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value={{ project_tag }}-public-rtb}]' \
+      --query RouteTable.RouteTableId --output text)
+    aws ec2 create-route --route-table-id $RTB --destination-cidr-block 0.0.0.0/0 \
+      --gateway-id {{ igw_id }} --region {{ aws_region }} >/dev/null
+    aws ec2 associate-route-table --route-table-id $RTB --subnet-id {{ public_subnet_id }} \
+      --region {{ aws_region }} >/dev/null
+    echo $RTB
+  register: pub_rtb_create
+  when: pub_rtb_lookup.stdout in ['', 'None']
+
+# ----- NAT GW ---------------------------------------------------------------
+- name: Look up NAT GW elastic IP
+  ansible.builtin.shell: >
+    aws ec2 describe-addresses --region {{ aws_region }}
+    --filters 'Name=tag:Name,Values={{ project_tag }}-nat-eip'
+    --query 'Addresses[0].AllocationId' --output text
+  register: eip_lookup
+  changed_when: false
+
+- name: Allocate NAT EIP
+  ansible.builtin.shell: |
+    aws ec2 allocate-address --domain vpc --region {{ aws_region }} \
+      --tag-specifications 'ResourceType=elastic-ip,Tags=[{Key=Name,Value={{ project_tag }}-nat-eip}]' \
+      --query AllocationId --output text
+  register: eip_create
+  when: eip_lookup.stdout in ['', 'None']
+
+- name: Set EIP allocation fact
+  ansible.builtin.set_fact:
+    nat_eip_id: "{{ eip_create.stdout if (eip_lookup.stdout in ['','None']) else eip_lookup.stdout }}"
+
+- name: Look up NAT gateway
+  ansible.builtin.shell: >
+    aws ec2 describe-nat-gateways --region {{ aws_region }}
+    --filter 'Name=tag:Name,Values={{ project_tag }}-nat'
+    'Name=state,Values=available,pending'
+    --query 'NatGateways[0].NatGatewayId' --output text
+  register: natgw_lookup
+  changed_when: false
+
+- name: Create NAT gateway
+  ansible.builtin.shell: |
+    set -e
+    NAT=$(aws ec2 create-nat-gateway --subnet-id {{ public_subnet_id }} \
+      --allocation-id {{ nat_eip_id }} --region {{ aws_region }} \
+      --tag-specifications 'ResourceType=natgateway,Tags=[{Key=Name,Value={{ project_tag }}-nat}]' \
+      --query NatGateway.NatGatewayId --output text)
+    aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT --region {{ aws_region }}
+    echo $NAT
+  register: natgw_create
+  when: natgw_lookup.stdout in ['', 'None']
+
+- name: Set NAT GW fact
+  ansible.builtin.set_fact:
+    nat_gw_id: "{{ natgw_create.stdout if (natgw_lookup.stdout in ['','None']) else natgw_lookup.stdout }}"
+
+# ----- Private route table --------------------------------------------------
+- name: Look up private route table
+  ansible.builtin.shell: >
+    aws ec2 describe-route-tables --region {{ aws_region }}
+    --filters 'Name=tag:Name,Values={{ project_tag }}-private-rtb'
+    --query 'RouteTables[0].RouteTableId' --output text
+  register: priv_rtb_lookup
+  changed_when: false
+
+- name: Create private route table + NAT route + association
+  ansible.builtin.shell: |
+    set -e
+    RTB=$(aws ec2 create-route-table --vpc-id {{ vpc_id }} --region {{ aws_region }} \
+      --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value={{ project_tag }}-private-rtb}]' \
+      --query RouteTable.RouteTableId --output text)
+    aws ec2 create-route --route-table-id $RTB --destination-cidr-block 0.0.0.0/0 \
+      --nat-gateway-id {{ nat_gw_id }} --region {{ aws_region }} >/dev/null
+    aws ec2 associate-route-table --route-table-id $RTB --subnet-id {{ private_subnet_id }} \
+      --region {{ aws_region }} >/dev/null
+    echo $RTB
+  register: priv_rtb_create
+  when: priv_rtb_lookup.stdout in ['', 'None']
+
+# ----- Security group -------------------------------------------------------
+- name: Look up security group
+  ansible.builtin.shell: >
+    aws ec2 describe-security-groups --region {{ aws_region }}
+    --filters 'Name=group-name,Values={{ project_tag }}-sg' 'Name=vpc-id,Values={{ vpc_id }}'
+    --query 'SecurityGroups[0].GroupId' --output text
+  register: sg_lookup
+  changed_when: false
+
+- name: Create SG + ingress rules
+  ansible.builtin.shell: |
+    set -e
+    SG=$(aws ec2 create-security-group --group-name {{ project_tag }}-sg \
+      --description "{{ project_tag }} lab" --vpc-id {{ vpc_id }} --region {{ aws_region }} \
+      --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value={{ project_tag }}-sg}]' \
+      --query GroupId --output text)
+    aws ec2 authorize-security-group-ingress --group-id $SG --region {{ aws_region }} \
+      --ip-permissions "IpProtocol=-1,UserIdGroupPairs=[{GroupId=$SG}]" >/dev/null
+    aws ec2 authorize-security-group-ingress --group-id $SG --region {{ aws_region }} \
+      --ip-permissions \
+        "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp={{ admin_cidr }}}]" \
+        "IpProtocol=tcp,FromPort=8443,ToPort=8443,IpRanges=[{CidrIp={{ admin_cidr }}}]" \
+        "IpProtocol=tcp,FromPort=3000,ToPort=3000,IpRanges=[{CidrIp={{ admin_cidr }}}]" \
+        "IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp={{ admin_cidr }}}]" \
+        "IpProtocol=tcp,FromPort=443,ToPort=443,IpRanges=[{CidrIp={{ admin_cidr }}}]" \
+        "IpProtocol=tcp,FromPort=8080,ToPort=8080,IpRanges=[{CidrIp={{ admin_cidr }}}]" \
+        "IpProtocol=tcp,FromPort=2049,ToPort=2049,IpRanges=[{CidrIp={{ admin_cidr }}}]" \
+        "IpProtocol=tcp,FromPort=9095,ToPort=9095,IpRanges=[{CidrIp={{ admin_cidr }}}]" >/dev/null
+    echo $SG
+  register: sg_create
+  when: sg_lookup.stdout in ['', 'None']
+
+- name: Set SG fact
+  ansible.builtin.set_fact:
+    sg_id: "{{ sg_create.stdout if (sg_lookup.stdout in ['','None']) else sg_lookup.stdout }}"
+
+# ----- Placement group ------------------------------------------------------
+- name: Cluster placement group (idempotent)
+  ansible.builtin.shell: |
+    aws ec2 create-placement-group --group-name {{ project_tag }}-cluster \
+      --strategy cluster --region {{ aws_region }} 2>&1 | tail -1
+  register: pg_out
+  changed_when: '"GroupId" in pg_out.stdout'
+  failed_when:
+    - pg_out.rc != 0
+    - "'already exists' not in pg_out.stdout"
+
+# ----- Discover RHEL 9 AMI (latest 9.7 from Red Hat 309956199498) ----------
+- name: Discover latest RHEL 9 AMI when not pinned
+  ansible.builtin.shell: |
+    aws ec2 describe-images --region {{ aws_region }} \
+      --owners 309956199498 \
+      --filters "Name=name,Values=RHEL-9.*_HVM-*-x86_64-*-Hourly2-GP3" "Name=architecture,Values=x86_64" "Name=state,Values=available" \
+      --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
+  register: ami_lookup
+  changed_when: false
+  when: aws_rhel_ami in ['', 'auto', None]
+
+- name: Set effective AMI id
+  ansible.builtin.set_fact:
+    effective_ami: "{{ aws_rhel_ami if (aws_rhel_ami not in ['','auto',None]) else ami_lookup.stdout }}"
+
+- name: Show effective AMI
+  ansible.builtin.debug: { var: effective_ami }
+
+# ----- Bastion --------------------------------------------------------------
+- name: Look up bastion
+  ansible.builtin.shell: >
+    aws ec2 describe-instances --region {{ aws_region }}
+    --filters 'Name=tag:Name,Values={{ project_tag }}-bastion'
+    'Name=instance-state-name,Values=pending,running'
+    --query 'Reservations[0].Instances[0].InstanceId' --output text
+  register: bastion_lookup
+  changed_when: false
+
+- name: Launch bastion
+  ansible.builtin.shell: |
+    aws ec2 run-instances --region {{ aws_region }} \
+      --image-id {{ effective_ami }} --instance-type {{ bastion_instance_type }} \
+      --key-name {{ keypair_name }} --subnet-id {{ public_subnet_id }} \
+      --security-group-ids {{ sg_id }} \
+      --associate-public-ip-address \
+      --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize={{ bastion_root_gb }},VolumeType=gp3,DeleteOnTermination=true}' \
+      --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value={{ project_tag }}-bastion},{Key=Project,Value={{ project_tag }}},{Key=Role,Value=bastion}]' \
+      --query 'Instances[0].InstanceId' --output text
+  register: bastion_create
+  when: bastion_lookup.stdout in ['', 'None']
+
+- name: Set bastion fact
+  ansible.builtin.set_fact:
+    bastion_id: "{{ bastion_create.stdout if (bastion_lookup.stdout in ['','None']) else bastion_lookup.stdout }}"
+
+# ----- Ceph nodes -----------------------------------------------------------
+- name: Build OSD device hint list
+  ansible.builtin.set_fact:
+    osd_devices: "{{ ['/dev/sdb','/dev/sdc','/dev/sdd','/dev/sde'][:osd_disks_per_node] }}"
+
+- name: Look up existing ceph nodes
+  ansible.builtin.shell: >
+    aws ec2 describe-instances --region {{ aws_region }}
+    --filters 'Name=tag:Name,Values={{ item.name }}'
+    'Name=instance-state-name,Values=pending,running'
+    --query 'Reservations[0].Instances[0].InstanceId' --output text
+  loop: "{{ ceph_nodes }}"
+  register: ceph_nodes_lookup
+  changed_when: false
+
+- name: Launch missing ceph nodes
+  ansible.builtin.shell: |
+    BDM='DeviceName=/dev/sda1,Ebs={VolumeSize={{ ceph_root_gb }},VolumeType=gp3,DeleteOnTermination=true}'
+    {% for d in osd_devices %}
+    BDM="$BDM DeviceName={{ d }},Ebs={VolumeSize={{ osd_disk_gb }},VolumeType=gp3,DeleteOnTermination=true}"
+    {% endfor %}
+    aws ec2 run-instances --region {{ aws_region }} \
+      --image-id {{ effective_ami }} --instance-type {{ ceph_instance_type }} \
+      --key-name {{ keypair_name }} --subnet-id {{ private_subnet_id }} \
+      --security-group-ids {{ sg_id }} \
+      --private-ip-address {{ item.item.ip }} \
+      --no-associate-public-ip-address \
+      --placement GroupName={{ project_tag }}-cluster \
+      --block-device-mappings $BDM \
+      --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value={{ item.item.name }}},{Key=Project,Value={{ project_tag }}},{Key=Role,Value=ceph},{Key=Labels,Value={{ item.item.labels | join('|') }}}]" \
+      --query 'Instances[0].InstanceId' --output text
+  loop: "{{ ceph_nodes_lookup.results }}"
+  loop_control: { label: "{{ item.item.name }}" }
+  when: item.stdout in ['', 'None']
+  register: ceph_create
+
+- name: Wait for all instances to be running
+  ansible.builtin.shell: |
+    aws ec2 wait instance-running --region {{ aws_region }} \
+      --filters "Name=tag:Project,Values={{ project_tag }}" "Name=instance-state-name,Values=pending,running"
+  changed_when: false
+
+# ----- Discover bastion public IP / private IPs (idempotent post-fact) -----
+- name: Read bastion details
+  ansible.builtin.shell: >
+    aws ec2 describe-instances --instance-ids {{ bastion_id }} --region {{ aws_region }}
+    --query 'Reservations[0].Instances[0].[PublicIpAddress,PublicDnsName]'
+    --output text
+  register: bastion_info
+  changed_when: false
+
+- name: Set bastion public IP fact
+  ansible.builtin.set_fact:
+    bastion_public_ip: "{{ bastion_info.stdout.split()[0] }}"
+
+- name: Show bastion public IP
+  ansible.builtin.debug: { msg: "Bastion {{ bastion_id }}  public_ip={{ bastion_public_ip }}" }
+
+# >>> Lesson learned: the ceph nodes use fixed private IPs and the bastion's
+# >>> public IP can be reused, so host keys from a PRIOR build collide with the
+# >>> freshly provisioned instances. ssh then aborts with "REMOTE HOST
+# >>> IDENTIFICATION HAS CHANGED" (StrictHostKeyChecking=accept-new only adds
+# >>> keys for UNKNOWN hosts; it never overrides a CHANGED key), and the
+# >>> wait_for_connection in 01_prepare_hosts hangs until timeout. Clear any
+# >>> stale entries now, before the first SSH, so accept-new re-adds fresh keys.
+- name: Clear stale SSH host keys from any previous build
+  ansible.builtin.shell: |
+    KH="{{ known_hosts_file }}"
+    mkdir -p "$(dirname "$KH")"
+    touch "$KH"
+    for h in {{ bastion_public_ip }} {{ ceph_nodes | map(attribute='ip') | join(' ') }}; do
+      ssh-keygen -R "$h" -f "$KH" >/dev/null 2>&1 || true
+    done
+  delegate_to: localhost
+  changed_when: false
+
+# ----- Route53 (optional) ---------------------------------------------------
+- name: Update Route 53 records (if zone vars set)
+  ansible.builtin.shell: |
+    cat > /tmp/r53.json <<EOF
+    {"Comment":"{{ project_tag }} lab","Changes":[
+    {"Action":"UPSERT","ResourceRecordSet":{"Name":"bastion.{{ route53_domain }}","Type":"A","TTL":60,"ResourceRecords":[{"Value":"{{ bastion_public_ip }}"}]}},
+    {% for n in ceph_nodes %}
+    {"Action":"UPSERT","ResourceRecordSet":{"Name":"{{ n.name }}.{{ route53_domain }}","Type":"A","TTL":60,"ResourceRecords":[{"Value":"{{ n.ip }}"}]}}{{ "," if not loop.last else "" }}
+    {% endfor %}
+    ,{"Action":"UPSERT","ResourceRecordSet":{"Name":"dashboard.{{ route53_domain }}","Type":"A","TTL":60,"ResourceRecords":[{"Value":"{{ (ceph_nodes | selectattr('labels','contains','_admin') | first).ip }}"}]}}
+    ,{"Action":"UPSERT","ResourceRecordSet":{"Name":"s3.{{ route53_domain }}","Type":"A","TTL":60,"ResourceRecords":[{"Value":"{{ (ceph_nodes | selectattr('labels','contains','rgw') | first).ip }}"}]}}
+    ]}
+    EOF
+    aws route53 change-resource-record-sets --hosted-zone-id {{ route53_zone_id }} \
+      --change-batch file:///tmp/r53.json --query 'ChangeInfo.Status' --output text
+  changed_when: false
+  when:
+    - route53_zone_id | length > 0
+    - route53_domain  | length > 0
+
+# ----- Populate in-memory inventory so subsequent plays can connect ---------
+- name: add_host bastion (public)
+  ansible.builtin.add_host:
+    name: bastion
+    ansible_host: "{{ bastion_public_ip }}"
+    groups: bastions
+  changed_when: false
+
+- name: add_host ceph nodes via bastion
+  ansible.builtin.add_host:
+    name: "{{ item.name }}"
+    ansible_host: "{{ item.ip }}"
+    groups:
+      - ceph
+      - "{{ 'admin' if '_admin' in item.labels else 'cephworkers' }}"
+    ansible_user: ec2-user
+    ansible_ssh_private_key_file: "{{ key_local_path }}"
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/ceph9-known_hosts -o "ProxyCommand=ssh -W %h:%p -i {{ key_local_path }} -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/ceph9-known_hosts ec2-user@{{ bastion_public_ip }}"'
+  loop: "{{ ceph_nodes }}"
+  loop_control: { label: "{{ item.name }}" }
+  changed_when: false
+
+- name: Wait for SSH on bastion
+  ansible.builtin.wait_for:
+    host: "{{ bastion_public_ip }}"
+    port: 22
+    timeout: 300
+    delay: 5
+  delegate_to: localhost
+
+- name: Save provisioning summary
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir }}/../.provisioned.json"
+    mode: '0644'
+    content: |
+      {
+        "vpc_id": "{{ vpc_id }}",
+        "public_subnet_id": "{{ public_subnet_id }}",
+        "private_subnet_id": "{{ private_subnet_id }}",
+        "igw_id": "{{ igw_id }}",
+        "nat_eip_id": "{{ nat_eip_id }}",
+        "nat_gw_id": "{{ nat_gw_id }}",
+        "sg_id": "{{ sg_id }}",
+        "bastion_id": "{{ bastion_id }}",
+        "bastion_public_ip": "{{ bastion_public_ip }}",
+        "effective_ami": "{{ effective_ami }}"
+      }

@@ -1,0 +1,13 @@
+# Red Hat UBI Python builder — runs fine under OpenShift's random (non-root) UID.
+FROM registry.access.redhat.com/ubi9/python-311:latest
+
+WORKDIR /opt/app-root/src
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py ./
+
+EXPOSE 8080
+# gunicorn serves the Flask `app` callable from app.py
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "120", "app:app"]

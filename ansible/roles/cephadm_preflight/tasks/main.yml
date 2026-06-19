@@ -1,0 +1,80 @@
+---
+# Install cephadm-ansible on the admin node, work around two known
+# cephadm-ansible 5.0.2 packaging bugs, then run the preflight playbook.
+
+- name: Install cephadm-ansible
+  ansible.builtin.dnf:
+    name: cephadm-ansible
+    state: present
+
+# >>> Lesson learned: cephadm-ansible 5.0.2 has a folded-scalar bug at
+# >>> line ~60 of cephadm-preflight.yml that produces a literal space inside
+# >>> the rhceph repo name ("rhceph-9-tools-for-rhel- 9-x86_64-rpms").
+# >>> Apply a deterministic exact-string substitution via python.
+- name: Patch folded-scalar bug in cephadm-preflight.yml (idempotent)
+  ansible.builtin.shell: |
+    {% raw %}
+    /usr/bin/python3 - <<'PYEOF'
+    p = "/usr/share/cephadm-ansible/cephadm-preflight.yml"
+    s = open(p).read()
+    BAD  = ("              community.general.rhsm_repository:\n"
+            "                name: >-\n"
+            "                  \"rhceph-{{ ceph_defaults_ceph_rhcs_version }}-tools-for-rhel-\n"
+            "                  {{ ansible_facts['distribution_major_version'] }}-{{ ansible_facts['architecture'] }}-rpms\"")
+    GOOD = ("              community.general.rhsm_repository:\n"
+            "                name: \"rhceph-{{ ceph_defaults_ceph_rhcs_version }}-tools-for-rhel-{{ ansible_facts['distribution_major_version'] }}-{{ ansible_facts['architecture'] }}-rpms\"")
+    if BAD in s:
+        open(p, "w").write(s.replace(BAD, GOOD))
+        print("PATCHED")
+    elif GOOD in s:
+        print("ALREADY_PATCHED")
+    else:
+        print("PATTERN_NOT_FOUND")
+    PYEOF
+    {% endraw %}
+  register: patch_out
+  changed_when: "'PATCHED' in patch_out.stdout"
+
+- name: Verify the patch is in place (or the file is already fixed in newer rpm)
+  ansible.builtin.fail:
+    msg: "cephadm-preflight.yml folded-scalar pattern not found and not already patched. The cephadm-ansible package may have changed shape — please re-inspect."
+  when: "'PATTERN_NOT_FOUND' in patch_out.stdout"
+
+- name: Write cephadm-ansible inventory
+  ansible.builtin.copy:
+    dest: /usr/share/cephadm-ansible/hosts
+    mode: '0644'
+    content: |
+      {% for n in ceph_nodes if n.name != 'ceph01' %}
+      {{ n.name }}
+      {% endfor %}
+      [admin]
+      ceph01
+
+- name: Ensure admin can ssh to itself (preflight runs against ceph01 too)
+  ansible.posix.authorized_key:
+    user: ec2-user
+    key: "{{ hostvars[groups['admin'][0]].admin_ssh_pub }}"
+    state: present
+  when: hostvars[groups['admin'][0]].admin_ssh_pub is defined
+
+# >>> Lesson learned: cephadm-ansible 5.0.2 also references undefined
+# >>> `client_group` and `infra_pkgs`. We pass `client_group=clients` and
+# >>> tolerate the `infra_pkgs` failure inside an informational "checks" task.
+- name: Run cephadm-preflight playbook (as ec2-user so its SSH keys are used)
+  ansible.builtin.shell: |
+    cd /usr/share/cephadm-ansible
+    ansible-playbook -i hosts cephadm-preflight.yml \
+      --extra-vars "ceph_origin=rhcs client_group=clients" \
+      -u ec2-user --become 2>&1
+  register: preflight
+  become: false
+  failed_when: >-
+    preflight.rc != 0 and
+    'infra_pkgs' not in preflight.stdout and
+    'Determine Package Installation Check Result' not in preflight.stdout
+  changed_when: "'changed=' in (preflight.stdout | regex_search('ceph01.*'))"
+
+- name: Show preflight summary
+  ansible.builtin.debug:
+    msg: "{{ preflight.stdout_lines[-12:] }}"

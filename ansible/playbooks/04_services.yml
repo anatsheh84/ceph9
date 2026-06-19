@@ -1,0 +1,7 @@
+---
+- name: Deploy CephFS, RGW, NFS, RBD pool
+  hosts: admin
+  become: true
+  gather_facts: false
+  roles:
+    - ceph_services

@@ -1,0 +1,13 @@
+# Object endpoint — ObjectBucketClaim on the external Ceph RGW storageclass.
+# Provisions a bucket on ceph9 RGW and creates, in this namespace:
+#   ConfigMap/ceph-demo-bucket  -> BUCKET_NAME, BUCKET_HOST, BUCKET_PORT, ...
+#   Secret/ceph-demo-bucket     -> AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# These are consumed by the Deployment via envFrom.
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: ceph-demo-bucket
+  namespace: ceph-demo
+spec:
+  generateBucketName: ceph-demo
+  storageClassName: ocs-external-storagecluster-ceph-rgw

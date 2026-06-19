@@ -1,0 +1,27 @@
+# Builds the app image in-cluster from your GitHub repo using the Containerfile.
+#
+# >>> EDIT spec.source.git.uri to your GitHub repo before deploying. <<<
+# contextDir assumes the repo root contains ocp-odf/demo-app (i.e. you push the
+# whole ceph9 working tree). Adjust if you push only the demo-app folder.
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: ceph-demo-app
+  namespace: ceph-demo
+spec:
+  source:
+    type: Git
+    git:
+      uri: https://github.com/REPLACE_ME/REPLACE_ME.git
+      ref: main
+    contextDir: ocp-odf/demo-app
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Containerfile
+  output:
+    to:
+      kind: ImageStreamTag
+      name: ceph-demo-app:latest
+  triggers:
+    - type: ConfigChange

@@ -1,0 +1,33 @@
+---
+- name: Prepare RHEL on all ceph nodes
+  hosts: ceph
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Wait for SSH (post-boot)
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+        sleep: 5
+    - name: Gather facts now that we're up
+      ansible.builtin.setup:
+  roles:
+    - rhel_prep
+
+- name: Establish SSH trust + /etc/hosts + hostnames
+  hosts: ceph
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Re-establish SSH after potential reboot
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+        sleep: 5
+  roles:
+    - ssh_trust
+
+- name: Run cephadm-preflight (admin node)
+  hosts: admin
+  become: true
+  gather_facts: false
+  roles:
+    - cephadm_preflight

@@ -1,0 +1,25 @@
+# ── secrets / credentials — NEVER commit ──────────────────────────────────
+ocp-odf/env.sh
+*.pem
+*.key
+id_ed25519
+id_rsa
+# ODF external connection details (contains ceph keyrings)
+ocp-odf/phase3-storage/*.external-details.json
+
+# ── generated / local state ───────────────────────────────────────────────
+ocp-odf/clusters/
+ansible/.provisioned.json
+
+# ── OS / editor cruft ─────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+
+# ── local ansible caches ──────────────────────────────────────────────────
+.ansible/
+**/.ansible/
+
+# ── python ────────────────────────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.pyc

@@ -1,0 +1,12 @@
+# Block endpoint — ReadWriteOnce PVC on the external Ceph RBD storageclass.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ceph-demo-block
+  namespace: ceph-demo
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ocs-external-storagecluster-ceph-rbd
+  resources:
+    requests:
+      storage: 5Gi

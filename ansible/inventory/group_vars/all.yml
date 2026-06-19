@@ -1,0 +1,72 @@
+---
+# ============================================================
+#  Ceph 9 on AWS RHEL — global variables
+#  No credentials are stored in this file.
+#  Required at runtime via environment / extra-vars:
+#    AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
+#    RH_USER, RH_PASS
+#  Optional extra-vars:  admin_cidr, route53_zone_id, route53_domain
+# ============================================================
+
+# --- AWS / region -------------------------------------------------------
+aws_region: "{{ lookup('env','AWS_DEFAULT_REGION') | default('us-east-2', true) }}"
+aws_availability_zone: "{{ aws_region }}a"
+
+# Set to 'auto' to discover the latest Red Hat RHEL 9 AMI in the region.
+# Override via -e aws_rhel_ami=ami-xxxx for reproducible builds.
+aws_rhel_ami: auto
+
+# --- networking ---------------------------------------------------------
+vpc_cidr:            10.20.0.0/16
+public_subnet_cidr:  10.20.1.0/24    # bastion + NAT GW
+private_subnet_cidr: 10.20.2.0/24    # ceph nodes (no public IPs)
+
+# Allowed inbound for SSH/dashboard/S3/NFS. "auto" → controller's public IP/32.
+admin_cidr: "{{ lookup('env','ADMIN_CIDR') | default('auto', true) }}"
+
+# --- naming -------------------------------------------------------------
+project_tag: ceph9-lab
+keypair_name: ceph9-lab
+key_local_path: "~/.ssh/ceph9-lab.pem"
+
+# Local known_hosts file used for all SSH to the lab. Must match the path in
+# ansible.cfg and inventory/hosts.yml. Expanded to an absolute path so the
+# ssh-keygen cleanup tasks (aws_infra / aws_teardown) can target it.
+known_hosts_file: "{{ lookup('env','HOME') }}/.ssh/ceph9-known_hosts"
+
+# --- sizing -------------------------------------------------------------
+bastion_instance_type: t3.large
+ceph_instance_type:    m5.2xlarge
+bastion_root_gb: 30
+ceph_root_gb:    60
+osd_disk_gb:     500
+osd_disks_per_node: 2          # → 8 OSDs total → ~1 TB usable @ replica 3
+
+# Per-node static IPs (4 nodes). 4-node minimum per RHCS9 Install Guide §2.
+ceph_nodes:
+  - { name: ceph01, ip: 10.20.2.11, labels: [_admin, mon, mgr, osd, mds] }
+  - { name: ceph02, ip: 10.20.2.12, labels: [mon, mgr, osd, rgw] }
+  - { name: ceph03, ip: 10.20.2.13, labels: [mon, osd, rgw, nfs] }
+  - { name: ceph04, ip: 10.20.2.14, labels: [osd, mds] }
+
+# --- DNS (optional) -----------------------------------------------------
+# Pass via -e or env. Leave empty to skip Route 53 registration entirely.
+route53_zone_id: "{{ lookup('env','ROUTE53_ZONE_ID') | default('', true) }}"
+route53_domain:  "{{ lookup('env','ROUTE53_DOMAIN')  | default('', true) }}"
+
+# --- Red Hat credentials (env only — never written to disk) -------------
+rh_username: "{{ lookup('env','RH_USER') }}"
+rh_password: "{{ lookup('env','RH_PASS') }}"
+
+rhel_repos:
+  - rhel-9-for-x86_64-baseos-rpms
+  - rhel-9-for-x86_64-appstream-rpms
+  - rhceph-9-tools-for-rhel-9-x86_64-rpms
+
+# --- Ceph services ------------------------------------------------------
+rgw_service_name: s3lab
+rgw_port: 8080
+nfs_cluster_name: nfslab
+cephfs_volume: cephfs
+rbd_pool_name: rbd
+rbd_pool_pg_num: 32

@@ -1,0 +1,7 @@
+---
+- name: Bootstrap ceph cluster on the admin node
+  hosts: admin
+  become: true
+  gather_facts: false
+  roles:
+    - cephadm_bootstrap

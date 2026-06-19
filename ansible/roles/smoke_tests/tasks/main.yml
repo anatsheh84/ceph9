@@ -1,0 +1,94 @@
+---
+# End-to-end smoke tests: RBD, CephFS, NFS, S3. Runs on the admin node.
+
+- name: --- RBD smoke ---
+  ansible.builtin.shell: |
+    set -e
+    cephadm shell -- rbd ls {{ rbd_pool_name }} | grep -qx smoke \
+      || cephadm shell -- rbd create {{ rbd_pool_name }}/smoke --size 1G
+    rbd map {{ rbd_pool_name }}/smoke
+    DEV=$(rbd showmapped | awk 'NR==2{print $5}')
+    test -n "$DEV"
+    blkid -p $DEV >/dev/null 2>&1 || mkfs.xfs -q -f $DEV
+    mkdir -p /mnt/rbd-smoke
+    mountpoint -q /mnt/rbd-smoke || mount $DEV /mnt/rbd-smoke
+    echo OK > /mnt/rbd-smoke/hello.txt
+    cat /mnt/rbd-smoke/hello.txt
+    umount /mnt/rbd-smoke
+    rbd unmap $DEV
+  changed_when: false
+
+- name: --- CephFS smoke ---
+  ansible.builtin.shell: |
+    set -e
+    if [ ! -f /etc/ceph/admin.secret ]; then
+      awk '/^[[:space:]]*key = /{print $3; exit}' /etc/ceph/ceph.client.admin.keyring > /etc/ceph/admin.secret
+      chmod 600 /etc/ceph/admin.secret
+    fi
+    mkdir -p /mnt/cephfs
+    mountpoint -q /mnt/cephfs || mount -t ceph admin@.{{ cephfs_volume }}=/ /mnt/cephfs -o secretfile=/etc/ceph/admin.secret
+    echo OK > /mnt/cephfs/hello.txt
+    cat /mnt/cephfs/hello.txt
+    umount /mnt/cephfs
+  changed_when: false
+
+- name: --- NFS smoke ---
+  ansible.builtin.shell: |
+    set -e
+    rpm -q nfs-utils >/dev/null 2>&1 || dnf install -y -q nfs-utils
+    mkdir -p /mnt/nfs
+    NFS_HOST={{ (ceph_nodes | selectattr('labels','contains','nfs') | first).ip }}
+    mountpoint -q /mnt/nfs || mount -t nfs4 $NFS_HOST:/cephfs /mnt/nfs
+    echo OK > /mnt/nfs/hello-nfs.txt
+    cat /mnt/nfs/hello-nfs.txt
+    umount /mnt/nfs
+  changed_when: false
+
+- name: S3 smoke - ensure awscli is installed
+  ansible.builtin.shell: |
+    if ! command -v aws >/dev/null; then
+      dnf install -y -q awscli2 || dnf install -y -q awscli
+    fi
+  changed_when: false
+
+- name: S3 smoke - ensure labuser exists and fetch credentials
+  ansible.builtin.shell: |
+    set -e
+    if cephadm shell -- radosgw-admin user info --uid=labuser --format=json >/tmp/labuser.json 2>/dev/null; then
+      :
+    else
+      cephadm shell -- radosgw-admin user create --uid=labuser --display-name='Lab User' --email=lab@example.com --format=json >/tmp/labuser.json
+    fi
+    AK=$(jq -r '.keys[0].access_key' /tmp/labuser.json)
+    SK=$(jq -r '.keys[0].secret_key' /tmp/labuser.json)
+    test -n "$AK" -a -n "$SK"
+    mkdir -p ~/.aws
+    cat > ~/.aws/credentials <<EOF
+    [ceph]
+    aws_access_key_id = $AK
+    aws_secret_access_key = $SK
+    EOF
+    echo "AK=$AK"
+  register: labuser
+  changed_when: false
+
+- name: S3 smoke - upload list download
+  ansible.builtin.shell: |
+    set -e
+    export AWS_EC2_METADATA_DISABLED=true AWS_DEFAULT_REGION=us-east-1
+    RGW_HOST={{ (ceph_nodes | selectattr('labels','contains','rgw') | first).ip }}
+    aws --profile ceph --endpoint-url http://$RGW_HOST:{{ rgw_port }} s3 mb s3://lab-bucket 2>/dev/null || true
+    echo OK > /tmp/s3hello.txt
+    aws --profile ceph --endpoint-url http://$RGW_HOST:{{ rgw_port }} s3 cp /tmp/s3hello.txt s3://lab-bucket/
+    aws --profile ceph --endpoint-url http://$RGW_HOST:{{ rgw_port }} s3 ls s3://lab-bucket/
+    aws --profile ceph --endpoint-url http://$RGW_HOST:{{ rgw_port }} s3 cp s3://lab-bucket/s3hello.txt -
+  register: s3
+  changed_when: false
+
+- name: --- Final ceph -s ---
+  ansible.builtin.command: cephadm shell -- ceph -s
+  register: final_status
+  changed_when: false
+
+- ansible.builtin.debug:
+    msg: "{{ final_status.stdout_lines }}"

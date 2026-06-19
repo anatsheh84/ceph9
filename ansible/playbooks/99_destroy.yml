@@ -1,0 +1,7 @@
+---
+- name: Teardown AWS infrastructure
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  roles:
+    - aws_teardown
