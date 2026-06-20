@@ -72,6 +72,9 @@ CEPH_FS_NAME = os.environ.get("CEPH_FS_NAME", "cephfs")
 CEPH_NFS_CLUSTER = os.environ.get("CEPH_NFS_CLUSTER", "nfslab")
 CEPH_NFS_SERVER = os.environ.get("CEPH_NFS_SERVER", "")
 CEPH_MON_HOSTS = os.environ.get("CEPH_MON_HOSTS", "10.20.2.11,10.20.2.12,10.20.2.13")
+CEPH_RBD_POOL = os.environ.get("CEPH_RBD_POOL", "rbd")
+
+TYPES = ("s3", "nfs", "cephfs", "rbd")
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,40}$")
 REGISTRY_PATH = os.path.join(BLOCK_DIR, ".portal-registry.json")
@@ -219,9 +222,74 @@ class CephAPI:
                         "this subvolume over NFS for external access."}
 
     @classmethod
+    def provision_rbd(cls, base, token, name):
+        c = cls.req(base, token, "POST", "/block/image", version="1.0", body={
+            "pool_name": CEPH_RBD_POOL, "name": name, "size": 1073741824,
+            "features": ["layering"]})
+        cls._ok(c, 200, 201)
+        return cls.rbd_details(base, token, name)
+
+    @classmethod
+    def rbd_details(cls, base, token, name):
+        img = next((i for i in cls.list_rbd_full(base, token) if i.get("name") == name), None)
+        if not img:
+            raise CephAPIError(f"RBD image {name} not found")
+        size = img.get("size", 0)
+        gib = f"{size / (1 << 30):.0f} GiB" if size else "?"
+        mons = ",".join(f"{m}:6789" for m in CEPH_MON_HOSTS.split(","))
+        return {"_type": "rbd", "name": name, "Pool": CEPH_RBD_POOL, "Image": name,
+                "Size": gib, "Monitors": mons,
+                "Map command": f"sudo rbd map {CEPH_RBD_POOL}/{name} --id <client> --keyring <keyring>",
+                "Note": "Consume in-cluster via the ceph-rbd StorageClass (block PVC); "
+                        "raw 'rbd map' needs a cephx key."}
+
+    @classmethod
     def details(cls, base, token, typ, name):
         return {"s3": cls.s3_details, "nfs": cls.nfs_details,
-                "cephfs": cls.cephfs_details}[typ](base, token, name)
+                "cephfs": cls.cephfs_details, "rbd": cls.rbd_details}[typ](base, token, name)
+
+    # ── live discovery (list everything that exists in Ceph) ──────────────
+    @classmethod
+    def _list(cls, base, token, path, version="1.0"):
+        r = cls.req(base, token, "GET", path, version=version)
+        if r.status_code == 403:
+            return None  # caller lacks the capability for this resource type
+        cls._ok(r, 200)
+        return r.json()
+
+    @classmethod
+    def list_s3(cls, base, token):
+        d = cls._list(base, token, "/rgw/bucket")
+        return list(d) if d else []
+
+    @classmethod
+    def list_nfs(cls, base, token):
+        d = cls._list(base, token, "/nfs-ganesha/export")
+        return [e.get("pseudo", "").lstrip("/") for e in (d or []) if e.get("pseudo")]
+
+    @classmethod
+    def list_cephfs(cls, base, token):
+        d = cls._list(base, token, f"/cephfs/subvolume/{CEPH_FS_NAME}")
+        return [s.get("name") for s in (d or []) if s.get("name")]
+
+    @classmethod
+    def list_rbd_full(cls, base, token):
+        d = cls._list(base, token, "/block/image", version="2.0")
+        out = []
+        for grp in (d or []):
+            for img in grp.get("value", []):
+                if img.get("pool_name") == CEPH_RBD_POOL:
+                    out.append(img)
+        return out
+
+    @classmethod
+    def list_rbd(cls, base, token):
+        return [i.get("name") for i in cls.list_rbd_full(base, token) if i.get("name")]
+
+    @classmethod
+    def list_all(cls, base, token):
+        return {"s3": cls.list_s3(base, token), "nfs": cls.list_nfs(base, token),
+                "cephfs": cls.list_cephfs(base, token), "rbd": cls.list_rbd(base, token)}
 
 
 # ───────────────────────────── registry (app RBAC) ───────────────────────
@@ -251,24 +319,40 @@ def registry_add(typ, name, creator):
         save_registry(items)
 
 
-def visible_entries(ctx):
-    items = sorted(load_registry(), key=lambda e: -e.get("created", 0))
-    if ctx["is_admin"]:
-        return items
-    return [e for e in items if e.get("creator") == ctx["user"]]
-
-
 def find_entry(typ, name):
     return next((e for e in load_registry()
                  if e["type"] == typ and e["name"] == name), None)
 
 
+def live_entries(ctx):
+    """LIVE discovery: list everything that actually exists in Ceph. Admins see
+    all; non-admins see only resources the registry attributes to them."""
+    reg = {(e["type"], e["name"]): e for e in load_registry()}
+    listers = {"s3": CephAPI.list_s3, "nfs": CephAPI.list_nfs,
+               "cephfs": CephAPI.list_cephfs, "rbd": CephAPI.list_rbd}
+    out = []
+    for typ, lister in listers.items():
+        try:
+            names = lister(ctx["base"], ctx["token"])
+        except Exception:  # noqa: BLE001
+            names = []
+        for name in names:
+            entry = reg.get((typ, name))
+            if ctx["is_admin"]:
+                out.append({"type": typ, "name": name,
+                            "creator": entry["creator"] if entry else "(external)"})
+            elif entry and entry.get("creator") == ctx["user"]:
+                out.append({"type": typ, "name": name, "creator": ctx["user"]})
+    out.sort(key=lambda x: (x["type"], x["name"]))
+    return out
+
+
 def authorize(ctx, typ, name):
-    """Return the registry entry if the user may access it, else raise/abort."""
+    """Admins may access anything live; non-admins only what they created."""
     entry = find_entry(typ, name)
-    if not entry:
-        abort(404)
-    if not ctx["is_admin"] and entry.get("creator") != ctx["user"]:
+    if ctx["is_admin"]:
+        return entry or {"type": typ, "name": name, "creator": "(external)"}
+    if not entry or entry.get("creator") != ctx["user"]:
         abort(403)
     return entry
 
@@ -340,7 +424,7 @@ def require_ceph():
 def render_index(**extra):
     listings = {ep: list_files(ep) for ep in ENDPOINTS}
     ctx = ceph_ctx()
-    entries = visible_entries(ctx) if ctx else []
+    entries = live_entries(ctx) if ctx else []
     return render_template_string(
         PAGE, endpoints=ENDPOINTS, listings=listings, object_ready=object_ready(),
         bucket=BUCKET_NAME or "(not provisioned)", node=os.environ.get("NODE_NAME", ""),
@@ -382,14 +466,14 @@ def provision():
         return render_index(active_tab="provision", msg=("error", "Log in to Ceph first."))
     ptype = request.form.get("ptype", "")
     name = (request.form.get("name", "") or "").strip().lower()
-    if ptype not in ("s3", "nfs", "cephfs"):
+    if ptype not in TYPES:
         return render_index(active_tab="provision", msg=("error", "Unknown provision type."))
     if not NAME_RE.match(name):
         return render_index(active_tab="provision",
                             msg=("error", "Name: 3-41 chars, lowercase letters/digits/dashes."))
     try:
         fn = {"s3": CephAPI.provision_s3, "nfs": CephAPI.provision_nfs,
-              "cephfs": CephAPI.provision_cephfs}[ptype]
+              "cephfs": CephAPI.provision_cephfs, "rbd": CephAPI.provision_rbd}[ptype]
         result = fn(ctx["base"], ctx["token"], name)
         registry_add(ptype, name, ctx["user"])
         return render_index(active_tab="provision", prov_result=result,
@@ -608,13 +692,13 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
         <form class="row" method="post" action="{{ url_for('provision') }}">
           <div class="field"><label>Type</label><select name="ptype">
             <option value="s3">S3 bucket (RGW)</option><option value="nfs">NFS export (nfslab)</option>
-            <option value="cephfs">CephFS subvolume</option></select></div>
+            <option value="cephfs">CephFS subvolume</option><option value="rbd">RBD image (block)</option></select></div>
           <div class="field"><label>Name</label><input type="text" name="name" placeholder="my-bucket-1" pattern="[a-z0-9][a-z0-9-]{2,40}" required></div>
           <button class="go" type="submit">Provision +</button></form></div>
 
-      <div class="card"><h2>Your provisioned endpoints
-        {% if ceph.is_admin %}<span class="badge">admin: showing all</span>{% endif %}</h2>
-        <div class="hint">Retrieve connection details any time, or browse S3 content.</div>
+      <div class="card"><h2>Provisioned endpoints on ceph9 <span class="badge">live</span>
+        {% if ceph.is_admin %}<span class="badge">admin: all resources</span>{% endif %}</h2>
+        <div class="hint">Discovered live from Ceph (S3 · NFS · CephFS · RBD). Retrieve connection details any time, or browse S3 content.{% if not ceph.is_admin %} You see resources you created.{% endif %}</div>
         {% if entries %}
         <table><tr><th>Type</th><th>Name</th><th>Owner</th><th>Actions</th></tr>
           {% for e in entries %}<tr>
