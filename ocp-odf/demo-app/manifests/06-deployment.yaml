@@ -12,6 +12,11 @@ metadata:
         "fieldPath":"spec.template.spec.containers[?(@.name==\"app\")].image"}]
 spec:
   replicas: 1
+  # The block (RBD) PVC is ReadWriteOnce — a rolling update would try to attach
+  # it to the new pod while the old still holds it (Multi-Attach error if they
+  # land on different nodes). Recreate terminates the old pod first.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: ceph-demo-app
