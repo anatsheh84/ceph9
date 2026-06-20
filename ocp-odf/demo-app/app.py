@@ -74,6 +74,14 @@ CEPH_NFS_SERVER = os.environ.get("CEPH_NFS_SERVER", "")
 CEPH_MON_HOSTS = os.environ.get("CEPH_MON_HOSTS", "10.20.2.11,10.20.2.12,10.20.2.13")
 CEPH_RBD_POOL = os.environ.get("CEPH_RBD_POOL", "rbd")
 
+# --- storage tiers ---
+RBD_POOLS = {"ssd": CEPH_RBD_POOL, "hdd": os.environ.get("CEPH_RBD_HDD_POOL", "rbd-hdd")}
+CEPHFS_HDD_POOL = os.environ.get("CEPH_CEPHFS_HDD_POOL", "cephfs.cephfs.data.hdd")
+RGW_HDD_SC = os.environ.get("CEPH_RGW_HDD_SC", "HDD")
+TIERS = ("ssd", "hdd")
+TIER_LABEL = {"ssd": "Tier0 · SSD", "hdd": "Tier1 · HDD"}
+RBD_POOL_TIER = {v: k for k, v in RBD_POOLS.items()}   # pool name -> tier
+
 TYPES = ("s3", "nfs", "cephfs", "rbd")
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,40}$")
@@ -150,7 +158,7 @@ class CephAPI:
 
     # ── provisioning ──────────────────────────────────────────────────────
     @classmethod
-    def provision_s3(cls, base, token, name):
+    def provision_s3(cls, base, token, name, tier="ssd"):
         u = cls.req(base, token, "POST", "/rgw/user", version="1.0", body={
             "uid": name, "display_name": name, "email": "",
             "max_buckets": 1000, "suspended": 0})
@@ -158,10 +166,10 @@ class CephAPI:
         b = cls.req(base, token, "POST", "/rgw/bucket", version="1.0",
                     body={"bucket": name, "uid": name})
         cls._ok(b, 200, 201)
-        return cls.s3_details(base, token, name)
+        return cls.s3_details(base, token, name, tier)
 
     @classmethod
-    def provision_nfs(cls, base, token, name):
+    def provision_nfs(cls, base, token, name, tier="ssd"):  # tier n/a for NFS export
         pseudo = "/" + name
         e = cls.req(base, token, "POST", "/nfs-ganesha/export", version="2.0", body={
             "cluster_id": CEPH_NFS_CLUSTER, "path": "/", "pseudo": pseudo,
@@ -172,11 +180,13 @@ class CephAPI:
         return cls.nfs_details(base, token, name)
 
     @classmethod
-    def provision_cephfs(cls, base, token, name):
-        c = cls.req(base, token, "POST", "/cephfs/subvolume", version="1.0", body={
-            "vol_name": CEPH_FS_NAME, "subvol_name": name, "size": 1073741824})
+    def provision_cephfs(cls, base, token, name, tier="ssd"):
+        body = {"vol_name": CEPH_FS_NAME, "subvol_name": name, "size": 1073741824}
+        if tier == "hdd":
+            body["pool_layout"] = CEPHFS_HDD_POOL
+        c = cls.req(base, token, "POST", "/cephfs/subvolume", version="1.0", body=body)
         cls._ok(c, 200, 201)
-        return cls.cephfs_details(base, token, name)
+        return cls.cephfs_details(base, token, name, tier)
 
     # ── details (re-derived live, any time) ───────────────────────────────
     @classmethod
@@ -205,11 +215,12 @@ class CephAPI:
         return k["access_key"], k["secret_key"], owner
 
     @classmethod
-    def s3_details(cls, base, token, name):
+    def s3_details(cls, base, token, name, tier="ssd"):
         access, secret, owner = cls.bucket_creds(base, token, name)
-        return {"_type": "s3", "name": name,
-                "Endpoint": f"http://{CEPH_RGW_ENDPOINT}", "Bucket": name,
-                "Owner": owner, "Access key": access, "Secret key": secret}
+        return {"_type": "s3", "name": name, "Tier": TIER_LABEL.get(tier, tier),
+                "Endpoint": f"http://{CEPH_RGW_ENDPOINT}", "Bucket": name, "Owner": owner,
+                "Object storage class": (RGW_HDD_SC if tier == "hdd" else "STANDARD"),
+                "Access key": access, "Secret key": secret}
 
     @classmethod
     def nfs_details(cls, base, token, name):
@@ -227,44 +238,53 @@ class CephAPI:
                 "Mount command": f"sudo mount -t nfs4 {host}:{pseudo} /mnt/{name}"}
 
     @classmethod
-    def cephfs_details(cls, base, token, name):
+    def cephfs_details(cls, base, token, name, tier="ssd"):
         info = cls.req(base, token, "GET",
                        f"/cephfs/subvolume/{CEPH_FS_NAME}/info?subvol_name={name}",
                        version="1.0")
         cls._ok(info, 200)
         path = info.json().get("path", "")
         mons = ",".join(f"{m}:6789" for m in CEPH_MON_HOSTS.split(","))
-        return {"_type": "cephfs", "name": name, "Filesystem": CEPH_FS_NAME,
-                "Subvolume": name, "Path": path, "Monitors": mons,
+        return {"_type": "cephfs", "name": name, "Tier": TIER_LABEL.get(tier, tier),
+                "Filesystem": CEPH_FS_NAME, "Subvolume": name, "Path": path,
+                "Data pool": (CEPHFS_HDD_POOL if tier == "hdd" else "default"),
+                "Monitors": mons,
                 "Note": "Mount in-cluster via the cephfs StorageClass, or export "
                         "this subvolume over NFS for external access."}
 
     @classmethod
-    def provision_rbd(cls, base, token, name):
+    def provision_rbd(cls, base, token, name, tier="ssd"):
+        pool = RBD_POOLS.get(tier, CEPH_RBD_POOL)
         c = cls.req(base, token, "POST", "/block/image", version="1.0", body={
-            "pool_name": CEPH_RBD_POOL, "name": name, "size": 1073741824,
-            "features": ["layering"]})
+            "pool_name": pool, "name": name, "size": 1073741824, "features": ["layering"]})
         cls._ok(c, 200, 201)
         return cls.rbd_details(base, token, name)
 
     @classmethod
-    def rbd_details(cls, base, token, name):
+    def rbd_details(cls, base, token, name, tier=None):
         img = next((i for i in cls.list_rbd_full(base, token) if i.get("name") == name), None)
         if not img:
             raise CephAPIError(f"RBD image {name} not found")
+        pool = img.get("pool_name", CEPH_RBD_POOL)
+        rtier = RBD_POOL_TIER.get(pool, "ssd")
         size = img.get("size", 0)
         gib = f"{size / (1 << 30):.0f} GiB" if size else "?"
         mons = ",".join(f"{m}:6789" for m in CEPH_MON_HOSTS.split(","))
-        return {"_type": "rbd", "name": name, "Pool": CEPH_RBD_POOL, "Image": name,
-                "Size": gib, "Monitors": mons,
-                "Map command": f"sudo rbd map {CEPH_RBD_POOL}/{name} --id <client> --keyring <keyring>",
-                "Note": "Consume in-cluster via the ceph-rbd StorageClass (block PVC); "
+        return {"_type": "rbd", "name": name, "Tier": TIER_LABEL.get(rtier, rtier),
+                "Pool": pool, "Image": name, "Size": gib, "Monitors": mons,
+                "Map command": f"sudo rbd map {pool}/{name} --id <client> --keyring <keyring>",
+                "Note": "Consume in-cluster via a ceph-rbd StorageClass (block PVC); "
                         "raw 'rbd map' needs a cephx key."}
 
     @classmethod
-    def details(cls, base, token, typ, name):
-        return {"s3": cls.s3_details, "nfs": cls.nfs_details,
-                "cephfs": cls.cephfs_details, "rbd": cls.rbd_details}[typ](base, token, name)
+    def details(cls, base, token, typ, name, tier="ssd"):
+        if typ == "s3":
+            return cls.s3_details(base, token, name, tier)
+        if typ == "cephfs":
+            return cls.cephfs_details(base, token, name, tier)
+        if typ == "nfs":
+            return cls.nfs_details(base, token, name)
+        return cls.rbd_details(base, token, name)
 
     # ── live discovery (list everything that exists in Ceph) ──────────────
     @classmethod
@@ -296,7 +316,7 @@ class CephAPI:
         out = []
         for grp in (d or []):
             for img in grp.get("value", []):
-                if img.get("pool_name") == CEPH_RBD_POOL:
+                if img.get("pool_name") in RBD_POOLS.values():
                     out.append(img)
         return out
 
@@ -329,11 +349,11 @@ def save_registry(items):
         pass
 
 
-def registry_add(typ, name, creator):
+def registry_add(typ, name, creator, tier="ssd"):
     items = load_registry()
     if not any(e["type"] == typ and e["name"] == name for e in items):
         items.append({"type": typ, "name": name, "creator": creator,
-                      "created": int(time.time())})
+                      "tier": tier, "created": int(time.time())})
         save_registry(items)
 
 
@@ -344,23 +364,37 @@ def find_entry(typ, name):
 
 def live_entries(ctx):
     """LIVE discovery: list everything that actually exists in Ceph. Admins see
-    all; non-admins see only resources the registry attributes to them."""
+    all; non-admins see only resources the registry attributes to them. Tier is
+    derived from the live pool for RBD, else from the registry."""
     reg = {(e["type"], e["name"]): e for e in load_registry()}
-    listers = {"s3": CephAPI.list_s3, "nfs": CephAPI.list_nfs,
-               "cephfs": CephAPI.list_cephfs, "rbd": CephAPI.list_rbd}
-    out = []
-    for typ, lister in listers.items():
+    found = []   # (type, name, tier)
+    # RBD — tier from the actual pool the image lives in
+    try:
+        for img in CephAPI.list_rbd_full(ctx["base"], ctx["token"]):
+            found.append(("rbd", img.get("name"),
+                          RBD_POOL_TIER.get(img.get("pool_name"), "ssd")))
+    except Exception:  # noqa: BLE001
+        pass
+    for typ, lister in (("s3", CephAPI.list_s3), ("nfs", CephAPI.list_nfs),
+                        ("cephfs", CephAPI.list_cephfs)):
         try:
             names = lister(ctx["base"], ctx["token"])
         except Exception:  # noqa: BLE001
             names = []
         for name in names:
-            entry = reg.get((typ, name))
-            if ctx["is_admin"]:
-                out.append({"type": typ, "name": name,
-                            "creator": entry["creator"] if entry else "(external)"})
-            elif entry and entry.get("creator") == ctx["user"]:
-                out.append({"type": typ, "name": name, "creator": ctx["user"]})
+            e = reg.get((typ, name))
+            found.append((typ, name, (e.get("tier", "ssd") if e else "—")))
+    out = []
+    for typ, name, tier in found:
+        e = reg.get((typ, name))
+        if ctx["is_admin"]:
+            owner = e["creator"] if e else "(external)"
+        elif e and e.get("creator") == ctx["user"]:
+            owner = ctx["user"]
+        else:
+            continue
+        out.append({"type": typ, "name": name, "tier": tier,
+                    "tierlabel": TIER_LABEL.get(tier, tier), "creator": owner})
     out.sort(key=lambda x: (x["type"], x["name"]))
     return out
 
@@ -489,13 +523,16 @@ def provision():
     if not NAME_RE.match(name):
         return render_index(active_tab="provision",
                             msg=("error", "Name: 3-41 chars, lowercase letters/digits/dashes."))
+    tier = (request.form.get("tier", "ssd") or "ssd").lower()
+    if tier not in TIERS:
+        tier = "ssd"
     try:
         fn = {"s3": CephAPI.provision_s3, "nfs": CephAPI.provision_nfs,
               "cephfs": CephAPI.provision_cephfs, "rbd": CephAPI.provision_rbd}[ptype]
-        result = fn(ctx["base"], ctx["token"], name)
-        registry_add(ptype, name, ctx["user"])
+        result = fn(ctx["base"], ctx["token"], name, tier)
+        registry_add(ptype, name, ctx["user"], tier)
         return render_index(active_tab="provision", prov_result=result,
-                            msg=("ok", f"Provisioned {ptype.upper()} '{name}' on ceph9."))
+                            msg=("ok", f"Provisioned {ptype.upper()} '{name}' ({TIER_LABEL.get(tier, tier)}) on ceph9."))
     except Exception as exc:  # noqa: BLE001
         return render_index(active_tab="provision", msg=("error", f"Provision failed: {exc}"))
 
@@ -505,8 +542,9 @@ def provision():
 def details(typ, name):
     ctx = require_ceph()
     entry = authorize(ctx, typ, name)
+    tier = entry.get("tier", "ssd") if entry else "ssd"
     try:
-        d = CephAPI.details(ctx["base"], ctx["token"], typ, name)
+        d = CephAPI.details(ctx["base"], ctx["token"], typ, name, tier)
     except Exception as exc:  # noqa: BLE001
         return render_template_string(DETAILS_PAGE, name=name, typ=typ, entry=entry,
                                       detail=None, error=str(exc))
@@ -536,12 +574,14 @@ def browse(name):
 @app.route("/browse/<name>/upload", methods=["POST"])
 def browse_upload(name):
     ctx = require_ceph()
-    authorize(ctx, "s3", name)
+    entry = authorize(ctx, "s3", name)
     f = request.files.get("file")
     if f and f.filename:
         try:
             access, secret, _ = CephAPI.bucket_creds(ctx["base"], ctx["token"], name)
-            s3_client_for(access, secret).upload_fileobj(f, name, secure_filename(f.filename))
+            extra = {"StorageClass": RGW_HDD_SC} if (entry and entry.get("tier") == "hdd") else {}
+            s3_client_for(access, secret).upload_fileobj(
+                f, name, secure_filename(f.filename), ExtraArgs=extra)
         except Exception:  # noqa: BLE001
             pass
     return redirect(url_for("browse", name=name))
@@ -710,6 +750,8 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
           <div class="field"><label>Type</label><select name="ptype">
             <option value="s3">S3 bucket (RGW)</option><option value="nfs">NFS export (nfslab)</option>
             <option value="cephfs">CephFS subvolume</option><option value="rbd">RBD image (block)</option></select></div>
+          <div class="field"><label>Tier</label><select name="tier">
+            <option value="ssd">Tier0 · SSD (gp3)</option><option value="hdd">Tier1 · HDD (st1)</option></select></div>
           <div class="field"><label>Name</label><input type="text" name="name" placeholder="my-bucket-1" pattern="[a-z0-9][a-z0-9-]{2,40}" required></div>
           <button class="go" type="submit">Provision +</button></form></div>
 
@@ -717,9 +759,10 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
         {% if ceph.is_admin %}<span class="badge">admin: all resources</span>{% endif %}</h2>
         <div class="hint">Discovered live from Ceph (S3 · NFS · CephFS · RBD). Retrieve connection details any time, or browse S3 content.{% if not ceph.is_admin %} You see resources you created.{% endif %}</div>
         {% if entries %}
-        <table><tr><th>Type</th><th>Name</th><th>Owner</th><th>Actions</th></tr>
+        <table><tr><th>Type</th><th>Tier</th><th>Name</th><th>Owner</th><th>Actions</th></tr>
           {% for e in entries %}<tr>
             <td><span class="t">{{ e.type|upper }}</span></td>
+            <td>{{ e.tierlabel }}</td>
             <td style="font-family:ui-monospace,monospace">{{ e.name }}</td>
             <td>{{ e.creator }}</td>
             <td><a class="ghost" href="{{ url_for('details', typ=e.type, name=e.name) }}">details</a>

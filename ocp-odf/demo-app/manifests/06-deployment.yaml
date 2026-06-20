@@ -57,6 +57,12 @@ spec:
               value: "10.20.2.13:2049"
             - name: CEPH_MON_HOSTS
               value: "10.20.2.11,10.20.2.12,10.20.2.13"
+            - name: CEPH_RBD_HDD_POOL
+              value: "rbd-hdd"
+            - name: CEPH_CEPHFS_HDD_POOL
+              value: "cephfs.cephfs.data.hdd"
+            - name: CEPH_RGW_HDD_SC
+              value: "HDD"
             - name: CEPH_API_PASSWORD
               valueFrom:
                 secretKeyRef:
