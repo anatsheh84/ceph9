@@ -70,3 +70,15 @@ nfs_cluster_name: nfslab
 cephfs_volume: cephfs
 rbd_pool_name: rbd
 rbd_pool_pg_num: 32
+
+# --- Storage tiers (optional — phase 06_storage_tiers) ------------------
+# Tier0 = existing gp3 OSDs (device class 'ssd'); Tier1 = new st1 HDD OSDs
+# (device class 'hdd', set manually since EBS always reports non-rotational).
+hdd_disk_type: st1            # throughput-optimized HDD (cost-optimized tier)
+hdd_disk_gb: 500
+hdd_device: /dev/sdd          # next free slot after the 2 gp3 OSD disks
+tier_pg_num: 32
+rbd_hdd_pool: rbd-hdd
+cephfs_hdd_data_pool: "cephfs.{{ cephfs_volume }}.data.hdd"
+rgw_hdd_data_pool: default.rgw.buckets.data.hdd
+rgw_hdd_storage_class: HDD

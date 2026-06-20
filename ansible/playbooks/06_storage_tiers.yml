@@ -1,0 +1,227 @@
+---
+# ============================================================================
+# Phase 06 (OPTIONAL) — add a second storage tier to the running Ceph cluster.
+#
+#   Tier0 = existing gp3 OSDs  -> device class 'ssd'  (unchanged)
+#   Tier1 = new   st1  OSDs    -> device class 'hdd'  (cost-optimized)
+#
+# Run AFTER the base build, with 00 to populate the inventory:
+#   ansible-playbook playbooks/00_provision_aws.yml playbooks/06_storage_tiers.yml
+#
+# Idempotent + re-runnable. Order is deliberate:
+#   * pin existing pools to the ssd rule and freeze rebalancing BEFORE the hdd
+#     disks appear (so Tier0 data never migrates onto the new OSDs);
+#   * the replicated_hdd CRUSH rule is created only AFTER the hdd device class
+#     exists (Ceph rejects a rule referencing a non-existent class);
+#   * Tier1 OSDs are identified by id >= (#nodes * osd_disks_per_node), which is
+#     stable across re-runs.
+# ============================================================================
+
+# ---------- PLAY A: CRUSH prep (admin) BEFORE disks are attached -------------
+- name: Tiers — CRUSH preparation
+  hosts: admin
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Stop cephadm auto-consuming new devices
+      ansible.builtin.command:
+        cmd: /usr/sbin/cephadm shell -- ceph orch apply osd --all-available-devices --unmanaged=true
+      changed_when: false
+
+    - name: Freeze data movement while we reclassify
+      ansible.builtin.shell: |
+        /usr/sbin/cephadm shell -- ceph osd set norebalance
+        /usr/sbin/cephadm shell -- ceph osd set nobackfill
+      changed_when: false
+
+    - name: Create the ssd CRUSH rule (idempotent; ssd class already exists)
+      ansible.builtin.shell: |
+        /usr/sbin/cephadm shell -- ceph osd crush rule ls 2>/dev/null | grep -qx replicated_ssd \
+          || /usr/sbin/cephadm shell -- ceph osd crush rule create-replicated replicated_ssd default host ssd
+        echo OK
+      changed_when: false
+
+    - name: Pin all existing pools to the ssd rule (no movement — only ssd OSDs exist now)
+      ansible.builtin.shell: |
+        for p in $(/usr/sbin/cephadm shell -- ceph osd pool ls 2>/dev/null); do
+          /usr/sbin/cephadm shell -- ceph osd pool set "$p" crush_rule replicated_ssd >/dev/null
+        done
+        echo OK
+      changed_when: false
+
+# ---------- PLAY B: attach st1 HDD volumes (localhost / aws cli) -------------
+- name: Tiers — attach st1 HDD volumes to every ceph node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create + attach one st1 volume per ceph node (idempotent)
+      ansible.builtin.shell: |
+        set -e
+        NAME="{{ item.name }}"
+        IID=$(aws ec2 describe-instances --region {{ aws_region }} \
+          --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=running" \
+          --query 'Reservations[0].Instances[0].InstanceId' --output text)
+        [ "$IID" = "None" ] && { echo "NO_INSTANCE"; exit 1; }
+        VOL=$(aws ec2 describe-volumes --region {{ aws_region }} \
+          --filters "Name=tag:Name,Values=$NAME-hdd" --query 'Volumes[0].VolumeId' --output text)
+        if [ "$VOL" = "None" ] || [ -z "$VOL" ]; then
+          VOL=$(aws ec2 create-volume --region {{ aws_region }} \
+            --availability-zone {{ aws_availability_zone }} \
+            --volume-type {{ hdd_disk_type }} --size {{ hdd_disk_gb }} \
+            --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=$NAME-hdd},{Key=Project,Value={{ project_tag }}}]" \
+            --query VolumeId --output text)
+          aws ec2 wait volume-available --region {{ aws_region }} --volume-ids "$VOL"
+          echo "CREATED $VOL"
+        fi
+        STATE=$(aws ec2 describe-volumes --region {{ aws_region }} --volume-ids "$VOL" \
+          --query 'Volumes[0].Attachments[0].State' --output text)
+        if [ "$STATE" != "attached" ]; then
+          aws ec2 attach-volume --region {{ aws_region }} --volume-id "$VOL" \
+            --instance-id "$IID" --device {{ hdd_device }} >/dev/null
+          aws ec2 wait volume-in-use --region {{ aws_region }} --volume-ids "$VOL"
+          echo "ATTACHED $VOL -> $IID"
+        fi
+      loop: "{{ ceph_nodes }}"
+      loop_control: { label: "{{ item.name }}" }
+      register: hdd_vol
+      changed_when: "'CREATED' in hdd_vol.stdout or 'ATTACHED' in hdd_vol.stdout"
+
+# ---------- PLAY C: add HDD OSDs, reclassify, build Tier1 pools (admin) ------
+- name: Tiers — HDD OSDs + Tier1 pools
+  hosts: admin
+  become: true
+  gather_facts: false
+  vars:
+    expected_osds: "{{ (ceph_nodes | length) * (osd_disks_per_node + 1) }}"
+    hdd_osd_min: "{{ (ceph_nodes | length) * osd_disks_per_node }}"   # ids >= this = Tier1
+  tasks:
+    - name: Current OSD count
+      ansible.builtin.shell: /usr/sbin/cephadm shell -- ceph osd ls 2>/dev/null | wc -l
+      register: osd_now
+      changed_when: false
+
+    - name: Add the HDD OSDs (only if not already present)
+      when: osd_now.stdout | int < expected_osds | int
+      block:
+        - name: Refresh cephadm device inventory (new disks aren't seen until refresh)
+          ansible.builtin.command:
+            cmd: /usr/sbin/cephadm shell -- ceph orch device ls --refresh
+          changed_when: false
+
+        - name: Wait until the new HDD devices are detected as available
+          ansible.builtin.shell: |
+            /usr/sbin/cephadm shell -- ceph orch device ls --format json 2>/dev/null \
+              | python3 -c "import sys,json; print(sum(1 for h in json.load(sys.stdin) for d in h.get('devices',[]) if d.get('available')))"
+          register: avail_devs
+          until: avail_devs.stdout | int >= (ceph_nodes | length)
+          retries: 30
+          delay: 20
+          changed_when: false
+
+        - name: Consume the available HDD devices as OSDs
+          ansible.builtin.command:
+            cmd: /usr/sbin/cephadm shell -- ceph orch apply osd --all-available-devices --unmanaged=false
+          changed_when: true
+
+        - name: Wait for all OSDs to be created ({{ expected_osds }} total)
+          ansible.builtin.shell: /usr/sbin/cephadm shell -- ceph osd ls 2>/dev/null | wc -l
+          register: osd_count
+          until: osd_count.stdout | int >= expected_osds | int
+          retries: 40
+          delay: 15
+          changed_when: false
+
+        - name: Re-disable auto-consume (keep tiers under explicit control)
+          ansible.builtin.command:
+            cmd: /usr/sbin/cephadm shell -- ceph orch apply osd --all-available-devices --unmanaged=true
+          changed_when: false
+
+    - name: Set device class 'hdd' on the Tier1 OSDs (id >= {{ hdd_osd_min }})
+      ansible.builtin.shell: |
+        for o in $(/usr/sbin/cephadm shell -- ceph osd ls 2>/dev/null | awk -v m={{ hdd_osd_min }} '$1>=m'); do
+          cur=$(/usr/sbin/cephadm shell -- ceph osd crush get-device-class osd.$o 2>/dev/null)
+          if [ "$cur" != hdd ]; then
+            /usr/sbin/cephadm shell -- ceph osd crush rm-device-class osd.$o >/dev/null
+            /usr/sbin/cephadm shell -- ceph osd crush set-device-class hdd osd.$o
+          fi
+        done
+        echo OK
+      changed_when: false
+
+    - name: Create the hdd CRUSH rule (now that the hdd class exists)
+      ansible.builtin.shell: |
+        /usr/sbin/cephadm shell -- ceph osd crush rule ls 2>/dev/null | grep -qx replicated_hdd \
+          || /usr/sbin/cephadm shell -- ceph osd crush rule create-replicated replicated_hdd default host hdd
+        echo OK
+      changed_when: false
+
+    - name: Tier1 RBD pool on hdd
+      ansible.builtin.shell: |
+        set -e
+        if /usr/sbin/cephadm shell -- ceph osd pool ls 2>/dev/null | grep -qx '{{ rbd_hdd_pool }}'; then echo EXISTS; else
+          /usr/sbin/cephadm shell -- ceph osd pool create {{ rbd_hdd_pool }} {{ tier_pg_num }} {{ tier_pg_num }} replicated replicated_hdd
+          /usr/sbin/cephadm shell -- ceph osd pool application enable {{ rbd_hdd_pool }} rbd
+          /usr/sbin/cephadm shell -- rbd pool init {{ rbd_hdd_pool }}
+          echo CREATED
+        fi
+      register: rbd_hdd
+      changed_when: "'CREATED' in rbd_hdd.stdout"
+
+    - name: Tier1 CephFS data pool on hdd + attach to filesystem
+      ansible.builtin.shell: |
+        set -e
+        if /usr/sbin/cephadm shell -- ceph osd pool ls 2>/dev/null | grep -qx '{{ cephfs_hdd_data_pool }}'; then echo EXISTS; else
+          /usr/sbin/cephadm shell -- ceph osd pool create {{ cephfs_hdd_data_pool }} {{ tier_pg_num }} {{ tier_pg_num }} replicated replicated_hdd
+          /usr/sbin/cephadm shell -- ceph osd pool application enable {{ cephfs_hdd_data_pool }} cephfs
+          /usr/sbin/cephadm shell -- ceph fs add_data_pool {{ cephfs_volume }} {{ cephfs_hdd_data_pool }}
+          echo CREATED
+        fi
+      register: cephfs_hdd
+      changed_when: "'CREATED' in cephfs_hdd.stdout"
+
+    - name: Tier1 RGW data pool + HDD storage class on default placement
+      ansible.builtin.shell: |
+        set -e
+        if /usr/sbin/cephadm shell -- ceph osd pool ls 2>/dev/null | grep -qx '{{ rgw_hdd_data_pool }}'; then
+          echo EXISTS
+        else
+          /usr/sbin/cephadm shell -- ceph osd pool create {{ rgw_hdd_data_pool }} {{ tier_pg_num }} {{ tier_pg_num }} replicated replicated_hdd
+          /usr/sbin/cephadm shell -- ceph osd pool application enable {{ rgw_hdd_data_pool }} rgw
+          /usr/sbin/cephadm shell -- radosgw-admin zonegroup placement add --rgw-zonegroup default --placement-id default-placement --storage-class {{ rgw_hdd_storage_class }}
+          /usr/sbin/cephadm shell -- radosgw-admin zone placement add --rgw-zone default --placement-id default-placement --storage-class {{ rgw_hdd_storage_class }} --data-pool {{ rgw_hdd_data_pool }}
+          echo CREATED
+        fi
+      register: rgw_hdd
+      changed_when: "'CREATED' in rgw_hdd.stdout"
+
+    - name: Restart RGW so it picks up the new storage class
+      ansible.builtin.command:
+        cmd: /usr/sbin/cephadm shell -- ceph orch restart rgw.{{ rgw_service_name }}
+      when: "'CREATED' in rgw_hdd.stdout"
+      changed_when: true
+      failed_when: false
+
+    - name: Unfreeze data movement
+      ansible.builtin.shell: |
+        /usr/sbin/cephadm shell -- ceph osd unset nobackfill
+        /usr/sbin/cephadm shell -- ceph osd unset norebalance
+      changed_when: false
+
+    - name: Wait for HEALTH_OK (post-backfill)
+      ansible.builtin.shell: /usr/sbin/cephadm shell -- ceph health 2>/dev/null
+      register: tier_health
+      until: "'HEALTH_OK' in tier_health.stdout"
+      retries: 60
+      delay: 15
+      changed_when: false
+
+    - name: Tier summary
+      ansible.builtin.shell: |
+        echo "OSD device classes:"; /usr/sbin/cephadm shell -- ceph osd crush tree 2>/dev/null | grep -E 'osd\.' | awk '{print $2}' | sort | uniq -c
+        echo "Tier1 pools:"; /usr/sbin/cephadm shell -- ceph osd pool ls 2>/dev/null | grep -E '{{ rbd_hdd_pool }}|{{ cephfs_hdd_data_pool }}|{{ rgw_hdd_data_pool }}'
+      register: summary
+      changed_when: false
+
+    - name: Show tier summary
+      ansible.builtin.debug: { msg: "{{ summary.stdout_lines }}" }
