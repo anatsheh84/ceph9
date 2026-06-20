@@ -186,12 +186,30 @@ class CephAPI:
         return (u.json().get("keys") or [{}])[0]
 
     @classmethod
+    def bucket_owner(cls, base, token, bucket):
+        r = cls.req(base, token, "GET", f"/rgw/bucket/{bucket}", version="1.0")
+        cls._ok(r, 200)
+        owner = r.json().get("owner")
+        if not owner:
+            raise CephAPIError(f"could not determine owner of bucket '{bucket}'")
+        return owner
+
+    @classmethod
+    def bucket_creds(cls, base, token, bucket):
+        """Resolve a bucket's real owner, then fetch that user's S3 keys.
+        (Owner uid is NOT always the bucket name — e.g. labuser, OBC users.)"""
+        owner = cls.bucket_owner(base, token, bucket)
+        k = cls.rgw_keys(base, token, owner)
+        if not k.get("access_key"):
+            raise CephAPIError(f"bucket owner '{owner}' has no S3 access keys")
+        return k["access_key"], k["secret_key"], owner
+
+    @classmethod
     def s3_details(cls, base, token, name):
-        k = cls.rgw_keys(base, token, name)
+        access, secret, owner = cls.bucket_creds(base, token, name)
         return {"_type": "s3", "name": name,
                 "Endpoint": f"http://{CEPH_RGW_ENDPOINT}", "Bucket": name,
-                "Access key": k.get("access_key", ""),
-                "Secret key": k.get("secret_key", "")}
+                "Owner": owner, "Access key": access, "Secret key": secret}
 
     @classmethod
     def nfs_details(cls, base, token, name):
@@ -502,8 +520,8 @@ def browse(name):
     authorize(ctx, "s3", name)
     error, objs = None, []
     try:
-        k = CephAPI.rgw_keys(ctx["base"], ctx["token"], name)
-        cli = s3_client_for(k["access_key"], k["secret_key"])
+        access, secret, _ = CephAPI.bucket_creds(ctx["base"], ctx["token"], name)
+        cli = s3_client_for(access, secret)
         resp = cli.list_objects_v2(Bucket=name)
         for o in sorted(resp.get("Contents", []), key=lambda x: x["Key"]):
             ctype = mimetypes.guess_type(o["Key"])[0] or "application/octet-stream"
@@ -522,9 +540,8 @@ def browse_upload(name):
     f = request.files.get("file")
     if f and f.filename:
         try:
-            k = CephAPI.rgw_keys(ctx["base"], ctx["token"], name)
-            s3_client_for(k["access_key"], k["secret_key"]).upload_fileobj(
-                f, name, secure_filename(f.filename))
+            access, secret, _ = CephAPI.bucket_creds(ctx["base"], ctx["token"], name)
+            s3_client_for(access, secret).upload_fileobj(f, name, secure_filename(f.filename))
         except Exception:  # noqa: BLE001
             pass
     return redirect(url_for("browse", name=name))
@@ -537,8 +554,8 @@ def browse_object(name, key):
     inline = request.args.get("inline") == "1"
     key = secure_filename(key)
     try:
-        k = CephAPI.rgw_keys(ctx["base"], ctx["token"], name)
-        obj = s3_client_for(k["access_key"], k["secret_key"]).get_object(Bucket=name, Key=key)
+        access, secret, _ = CephAPI.bucket_creds(ctx["base"], ctx["token"], name)
+        obj = s3_client_for(access, secret).get_object(Bucket=name, Key=key)
         data = obj["Body"].read()
         ctype = mimetypes.guess_type(key)[0] or "application/octet-stream"
         return send_file(io.BytesIO(data), mimetype=ctype if inline else None,
