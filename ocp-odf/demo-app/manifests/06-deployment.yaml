@@ -35,6 +35,28 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # ── Ceph REST API (self-service provisioning) ──
+            - name: CEPH_API_HOSTS
+              value: "10.20.2.11,10.20.2.12,10.20.2.13,10.20.2.14"
+            - name: CEPH_API_PORT
+              value: "8443"
+            - name: CEPH_API_USER
+              value: "admin"
+            - name: CEPH_RGW_ENDPOINT
+              value: "10.20.2.12:8080"
+            - name: CEPH_FS_NAME
+              value: "cephfs"
+            - name: CEPH_NFS_CLUSTER
+              value: "nfslab"
+            - name: CEPH_NFS_SERVER
+              value: "10.20.2.13:2049"
+            - name: CEPH_MON_HOSTS
+              value: "10.20.2.11,10.20.2.12,10.20.2.13"
+            - name: CEPH_API_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ceph-dashboard-creds
+                  key: password
           envFrom:
             # Object bucket details + credentials from the OBC.
             - configMapRef:

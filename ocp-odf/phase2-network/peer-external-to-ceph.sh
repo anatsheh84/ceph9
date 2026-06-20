@@ -129,6 +129,8 @@ authorize tcp 6789 6789 "ceph-mon-msgr1"
 authorize tcp 6800 7300 "ceph-osd-mgr"
 authorize tcp 8080 8080 "ceph-rgw-s3"
 authorize tcp 9283 9283 "ceph-mgr-prometheus"
+authorize tcp 8443 8443 "ceph-mgr-dashboard-api"   # self-service provisioning (REST API)
+authorize tcp 2049 2049 "ceph-nfs"                 # NFS export mounts
 
 echo
 ok "Phase 2 complete: ${pcx} active, routes + SG in place."

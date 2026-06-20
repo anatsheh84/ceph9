@@ -12,7 +12,7 @@ OCPODF="$(cd "${HERE}/.." && pwd)"                       # .../ocp-odf
 # shellcheck source=../lib.sh
 source "${OCPODF}/lib.sh"
 
-require_env EXT_NAME GITHUB_USER GITHUB_TOKEN
+require_env EXT_NAME GITHUB_USER GITHUB_TOKEN CEPH_API_PASSWORD
 KUBECONFIG="$(cluster_kubeconfig "${EXT_NAME}")"; export KUBECONFIG
 [[ -r "${KUBECONFIG}" ]] || fail "kubeconfig for ${EXT_NAME} not found — run Phase 1"
 require_cli oc curl
@@ -29,6 +29,11 @@ oc create secret generic github-source-secret -n "${NS}" \
   --type=kubernetes.io/basic-auth \
   --from-literal=username="${GITHUB_USER}" \
   --from-literal=password="${GITHUB_TOKEN}" \
+  --dry-run=client -o yaml | oc apply -f - >/dev/null
+
+info "Creating Ceph dashboard API secret (for self-service provisioning)..."
+oc create secret generic ceph-dashboard-creds -n "${NS}" \
+  --from-literal=password="${CEPH_API_PASSWORD}" \
   --dry-run=client -o yaml | oc apply -f - >/dev/null
 
 # 2. Everything else (PVCs, OBC, ImageStream, BuildConfig, Deployment, Svc, Route).
