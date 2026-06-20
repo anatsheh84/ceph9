@@ -33,6 +33,23 @@ Two OpenShift clusters on AWS, each showcasing one OpenShift Data Foundation
 | **2** | Network: peer Cluster B's VPC ↔ ceph9 VPC + routes + SG rules | `phase2-network/peer-external-to-ceph.sh` | B only | ✅ tested |
 | **3a** | ODF **internal** mode | `phase3-storage/odf-internal.sh` | A | ✅ tested |
 | **3b** | ODF **external** mode → ceph9 | `phase3-storage/odf-external.sh` | B | ✅ tested |
+| **4** | Storage demo + self-service portal app | `demo-app/deploy.sh` | B | ✅ tested |
+| **5** | Tier1 (HDD) StorageClasses | `phase5-tiers/add-tier-storageclasses.sh` | B | ✅ tested |
+
+### Storage tiers (Tier0 SSD / Tier1 HDD)
+The ceph9 cluster carries two CRUSH device-class tiers (set up by
+`../ansible/playbooks/06_storage_tiers.yml`): **Tier0 = `ssd`** (gp3) and
+**Tier1 = `hdd`** (st1), each with its own pools. On `ocp-external` this surfaces as:
+
+| Endpoint | Tier0 StorageClass | Tier1 StorageClass |
+|---|---|---|
+| Block (RBD) | `ocs-external-storagecluster-ceph-rbd` | `ceph-rbd-hdd` |
+| File (CephFS) | `ocs-external-storagecluster-cephfs` | `cephfs-hdd` |
+| Object (RGW) | default placement (STANDARD) | `HDD` object storage class |
+
+The demo-app's self-service form has a **Tier** selector that provisions into the
+chosen tier (RBD→`rbd-hdd`, CephFS→hdd `pool_layout`, S3→`HDD` storage class), and
+shows each resource's tier in the live list + details.
 
 > All phases are implemented and have been run end-to-end against the ceph9
 > cluster. Each script is idempotent and re-runnable.
