@@ -1,9 +1,17 @@
 ---
-# End-to-end. Run with:
-#   RH_USER=user@redhat.com RH_PASS='...' ansible-playbook playbooks/site.yml
+# End-to-end build of the full ceph9 cluster (base + storage tiers + HA endpoints).
+# Run with:
+#   AWS_* + RH_USER/RH_PASS [+ CEPH_DASHBOARD_PASSWORD] in env
+#   ansible-playbook playbooks/site.yml
+#
+# 00-05 = base cluster (HEALTH_OK, RBD/CephFS/RGW/NFS).
+# 06-07 = the advanced demo capabilities (st1 HDD tier; NFS HA + internal NLBs
+#         for RGW & NFS). They add EBS cost; drop them for a base-only build.
 - ansible.builtin.import_playbook: 00_provision_aws.yml
 - ansible.builtin.import_playbook: 01_prepare_hosts.yml
 - ansible.builtin.import_playbook: 02_bootstrap.yml
 - ansible.builtin.import_playbook: 03_cluster.yml
 - ansible.builtin.import_playbook: 04_services.yml
 - ansible.builtin.import_playbook: 05_smoke.yml
+- ansible.builtin.import_playbook: 06_storage_tiers.yml
+- ansible.builtin.import_playbook: 07_nfs_ha_lb.yml

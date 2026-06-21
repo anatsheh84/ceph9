@@ -41,11 +41,15 @@ endpoints** behind internal AWS load balancers.
 
 ## Phases (each idempotent & re-runnable)
 
+**`ansible/playbooks/site.yml` runs the whole ceph9 build (00–07):** base cluster
++ storage tiers + NFS HA + internal NLBs. (Run any phase standalone with
+`00_provision_aws.yml <NN>_*.yml` for the inventory.)
+
 | Phase | Script | Result |
 |---|---|---|
-| ceph9 base | `ansible/playbooks/site.yml` | RHCS 9 cluster, HEALTH_OK |
-| ceph9 06 *(opt)* | `ansible/playbooks/06_storage_tiers.yml` | **Tier1 HDD** (st1 OSDs, `hdd` class, rbd/cephfs/rgw hdd pools) |
-| ceph9 07 *(opt)* | `ansible/playbooks/07_nfs_ha_lb.yml` | **HA**: 2 ganesha + **internal NLBs** for NFS (2049) & RGW (8080) |
+| ceph9 00–05 | `ansible/playbooks/site.yml` | RHCS 9 cluster, HEALTH_OK (RBD/CephFS/RGW/NFS) |
+| ceph9 06 | `…/06_storage_tiers.yml` (in site.yml) | **Tier1 HDD** (st1 OSDs, `hdd` class, rbd/cephfs/rgw hdd pools, `hdd-placement`) |
+| ceph9 07 | `…/07_nfs_ha_lb.yml` (in site.yml) | **HA**: 2 ganesha + **internal NLBs** for NFS (2049) & RGW (8080) |
 | ocp 0 | `ocp-odf/phase0-prereqs/00-prereqs.sh` | pre-flight checks |
 | ocp 1 | `ocp-odf/phase1-deploy/deploy-cluster.sh both` | both OCP clusters (own VPCs) |
 | ocp 2 | `ocp-odf/phase2-network/peer-external-to-ceph.sh` | peer `ocp-external` ↔ ceph9 VPC |
@@ -89,3 +93,11 @@ failover verified.
 `ocp-odf/env.sh` is the only place real credentials go and is gitignored, along with
 `clusters/` (kubeconfigs), `*.pem`, and the ODF external-details JSON (ceph keyrings).
 Never commit those.
+
+Env vars: ceph9 build needs `AWS_*`, `RH_USER`/`RH_PASS`, and (to set the dashboard
+admin password the portal authenticates with) `CEPH_DASHBOARD_PASSWORD`. The ocp-odf
+phases additionally need `CEPH_API_PASSWORD` (= the dashboard password), the GitHub
+build creds, and the ceph9 SSH/bastion vars — all listed in `ocp-odf/env.sh.example`.
+
+> Architecture diagram for customer demos lives on Miro (built via the Miro MCP) and
+> as an interactive page in the portal at `/architecture`.

@@ -81,3 +81,16 @@
   retries: 45
   delay: 15
   changed_when: false
+
+# The demo-app provisions via the dashboard/mgr REST API as 'admin'. Set the
+# password to a known value so a rebuild matches the app's CEPH_API_PASSWORD.
+- name: Set Ceph dashboard admin password (for app REST API access)
+  ansible.builtin.shell: |
+    set -e
+    echo -n '{{ ceph_dashboard_password }}' > /tmp/ceph_dashpw
+    /usr/sbin/cephadm shell --mount /tmp/ceph_dashpw -- \
+      ceph dashboard ac-user-set-password admin -i /mnt/ceph_dashpw --force-password-policy
+    rm -f /tmp/ceph_dashpw
+  when: ceph_dashboard_password | length > 0
+  no_log: true
+  changed_when: true
