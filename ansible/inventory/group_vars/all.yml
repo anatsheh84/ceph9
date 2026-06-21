@@ -83,9 +83,18 @@ cephfs_hdd_data_pool: "cephfs.{{ cephfs_volume }}.data.hdd"
 rgw_hdd_data_pool: default.rgw.buckets.data.hdd
 rgw_hdd_storage_class: HDD
 
-# --- NFS HA + internal NLB (optional — phase 07_nfs_ha_lb) --------------
+# --- HA endpoints: NFS + RGW behind internal NLBs (phase 07_nfs_ha_lb) ---
 # Hosts that run ganesha (get the 'nfs' label). 2+ for HA.
 nfs_ha_hosts: [ceph03, ceph04]
 nfs_port: 2049
 nfs_nlb_name: ceph9-nfs-nlb
 nfs_nlb_tg_name: ceph9-nfs-tg
+# RGW hosts already carry the 'rgw' label from the base build.
+rgw_ha_hosts: [ceph02, ceph03]
+rgw_lb_port: 8080
+rgw_nlb_name: ceph9-rgw-nlb
+rgw_nlb_tg_name: ceph9-rgw-tg
+# One internal NLB per service (looped by the playbook).
+ceph_nlbs:
+  - { name: "{{ nfs_nlb_name }}", tg: "{{ nfs_nlb_tg_name }}", port: "{{ nfs_port }}",   hosts: "{{ nfs_ha_hosts }}" }
+  - { name: "{{ rgw_nlb_name }}", tg: "{{ rgw_nlb_tg_name }}", port: "{{ rgw_lb_port }}", hosts: "{{ rgw_ha_hosts }}" }

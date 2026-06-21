@@ -15,7 +15,7 @@ source "${OCPODF}/lib.sh"
 require_env EXT_NAME GITHUB_USER GITHUB_TOKEN CEPH_API_PASSWORD
 KUBECONFIG="$(cluster_kubeconfig "${EXT_NAME}")"; export KUBECONFIG
 [[ -r "${KUBECONFIG}" ]] || fail "kubeconfig for ${EXT_NAME} not found — run Phase 1"
-require_cli oc curl
+require_cli oc curl aws
 NS=ceph-demo
 MANIFESTS="${HERE}/manifests"
 
@@ -40,6 +40,18 @@ oc create secret generic ceph-dashboard-creds -n "${NS}" \
 info "Applying manifests..."
 oc apply -k "${MANIFESTS}" >/dev/null
 ok "Manifests applied"
+
+# If the RGW NLB (phase 07) exists, point the app's S3 endpoint at it for HA;
+# otherwise the manifest default (a single rgw node) stands.
+if aws elbv2 describe-load-balancers --names ceph9-rgw-nlb >/dev/null 2>&1; then
+  rgw_nlb_ip=$(aws ec2 describe-network-interfaces \
+    --filters "Name=description,Values=ELB net/ceph9-rgw-nlb/*" \
+    --query 'NetworkInterfaces[0].PrivateIpAddress' --output text 2>/dev/null)
+  if [[ -n "${rgw_nlb_ip}" && "${rgw_nlb_ip}" != "None" ]]; then
+    oc -n "${NS}" set env deploy/ceph-demo-app "CEPH_RGW_ENDPOINT=${rgw_nlb_ip}:8080" >/dev/null
+    ok "S3 endpoint -> RGW NLB ${rgw_nlb_ip}:8080 (HA)"
+  fi
+fi
 
 # 3. Build the image from GitHub.
 info "Starting build from ${GITHUB_USER}/ceph9 (contextDir ocp-odf/demo-app)..."
