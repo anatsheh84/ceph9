@@ -195,10 +195,25 @@
       register: rgw_hdd
       changed_when: "'CREATED' in rgw_hdd.stdout"
 
-    - name: Restart RGW so it picks up the new storage class
+    - name: Tier1 RGW bucket-level placement target (hdd-placement)
+      ansible.builtin.shell: |
+        set -e
+        if /usr/sbin/cephadm shell -- radosgw-admin zonegroup placement list 2>/dev/null | grep -q 'hdd-placement'; then
+          echo EXISTS
+        else
+          /usr/sbin/cephadm shell -- radosgw-admin zonegroup placement add --rgw-zonegroup default --placement-id hdd-placement
+          /usr/sbin/cephadm shell -- radosgw-admin zone placement add --rgw-zone default --placement-id hdd-placement \
+            --data-pool {{ rgw_hdd_data_pool }} --index-pool default.rgw.buckets.index --data-extra-pool default.rgw.buckets.non-ec
+          /usr/sbin/cephadm shell -- radosgw-admin period update --commit 2>/dev/null || true
+          echo CREATED
+        fi
+      register: rgw_placement
+      changed_when: "'CREATED' in rgw_placement.stdout"
+
+    - name: Restart RGW so it picks up the new storage class / placement
       ansible.builtin.command:
         cmd: /usr/sbin/cephadm shell -- ceph orch restart rgw.{{ rgw_service_name }}
-      when: "'CREATED' in rgw_hdd.stdout"
+      when: "'CREATED' in rgw_hdd.stdout or 'CREATED' in rgw_placement.stdout"
       changed_when: true
       failed_when: false
 

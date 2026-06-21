@@ -78,6 +78,9 @@ CEPH_RBD_POOL = os.environ.get("CEPH_RBD_POOL", "rbd")
 RBD_POOLS = {"ssd": CEPH_RBD_POOL, "hdd": os.environ.get("CEPH_RBD_HDD_POOL", "rbd-hdd")}
 CEPHFS_HDD_POOL = os.environ.get("CEPH_CEPHFS_HDD_POOL", "cephfs.cephfs.data.hdd")
 RGW_HDD_SC = os.environ.get("CEPH_RGW_HDD_SC", "HDD")
+# RGW placement target whose default (STANDARD) class lives on the hdd pool —
+# buckets created here are HDD by default (bucket-level tier).
+RGW_HDD_PLACEMENT = os.environ.get("CEPH_RGW_HDD_PLACEMENT", "hdd-placement")
 TIERS = ("ssd", "hdd")
 TIER_LABEL = {"ssd": "Tier0 · SSD", "hdd": "Tier1 · HDD"}
 RBD_POOL_TIER = {v: k for k, v in RBD_POOLS.items()}   # pool name -> tier
@@ -159,25 +162,48 @@ class CephAPI:
     # ── provisioning ──────────────────────────────────────────────────────
     @classmethod
     def provision_s3(cls, base, token, name, tier="ssd"):
+        # Create the RGW user via the dashboard API (returns S3 keys)...
         u = cls.req(base, token, "POST", "/rgw/user", version="1.0", body={
             "uid": name, "display_name": name, "email": "",
             "max_buckets": 1000, "suspended": 0})
         cls._ok(u, 200, 201)
-        b = cls.req(base, token, "POST", "/rgw/bucket", version="1.0",
-                    body={"bucket": name, "uid": name})
-        cls._ok(b, 200, 201)
+        k = (u.json().get("keys") or [{}])[0]
+        ak, sk = k.get("access_key"), k.get("secret_key")
+        if not ak:
+            raise CephAPIError("RGW user created without S3 keys")
+        # ...then create the bucket via S3 so we can pin its placement target.
+        # tier=hdd -> ':hdd-placement' (bucket is HDD by default, no per-object header).
+        cli = s3_client_for(ak, sk)
+        if tier == "hdd":
+            cli.create_bucket(Bucket=name,
+                              CreateBucketConfiguration={"LocationConstraint": ":" + RGW_HDD_PLACEMENT})
+        else:
+            cli.create_bucket(Bucket=name)
         return cls.s3_details(base, token, name, tier)
 
     @classmethod
-    def provision_nfs(cls, base, token, name, tier="ssd"):  # tier n/a for NFS export
+    def provision_nfs(cls, base, token, name, tier="ssd"):
+        # tier=hdd -> export an hdd-pool CephFS subvolume (data lands on hdd);
+        # tier=ssd -> export the fs root (default data pool).
+        path = "/"
+        if tier == "hdd":
+            sub = "nfs-" + name
+            c = cls.req(base, token, "POST", "/cephfs/subvolume", version="1.0", body={
+                "vol_name": CEPH_FS_NAME, "subvol_name": sub, "size": 1073741824,
+                "pool_layout": CEPHFS_HDD_POOL})
+            cls._ok(c, 200, 201)
+            info = cls.req(base, token, "GET",
+                           f"/cephfs/subvolume/{CEPH_FS_NAME}/info?subvol_name={sub}", version="1.0")
+            if info.status_code == 200:
+                path = info.json().get("path", "/")
         pseudo = "/" + name
         e = cls.req(base, token, "POST", "/nfs-ganesha/export", version="2.0", body={
-            "cluster_id": CEPH_NFS_CLUSTER, "path": "/", "pseudo": pseudo,
+            "cluster_id": CEPH_NFS_CLUSTER, "path": path, "pseudo": pseudo,
             "access_type": "RW", "squash": "no_root_squash",
             "security_label": False, "protocols": [4], "transports": ["TCP"],
             "fsal": {"name": "CEPH", "fs_name": CEPH_FS_NAME}, "clients": []})
         cls._ok(e, 200, 201)
-        return cls.nfs_details(base, token, name)
+        return cls.nfs_details(base, token, name, tier)
 
     @classmethod
     def provision_cephfs(cls, base, token, name, tier="ssd"):
@@ -215,15 +241,22 @@ class CephAPI:
         return k["access_key"], k["secret_key"], owner
 
     @classmethod
-    def s3_details(cls, base, token, name, tier="ssd"):
-        access, secret, owner = cls.bucket_creds(base, token, name)
-        return {"_type": "s3", "name": name, "Tier": TIER_LABEL.get(tier, tier),
-                "Endpoint": f"http://{CEPH_RGW_ENDPOINT}", "Bucket": name, "Owner": owner,
-                "Object storage class": (RGW_HDD_SC if tier == "hdd" else "STANDARD"),
-                "Access key": access, "Secret key": secret}
+    def s3_details(cls, base, token, name, tier=None):
+        # Tier is authoritative from the bucket's live placement_rule.
+        r = cls.req(base, token, "GET", f"/rgw/bucket/{name}", version="1.0")
+        cls._ok(r, 200)
+        info = r.json()
+        owner = info.get("owner")
+        placement = info.get("placement_rule") or "default-placement"
+        dtier = "hdd" if placement == RGW_HDD_PLACEMENT else "ssd"
+        k = cls.rgw_keys(base, token, owner)
+        return {"_type": "s3", "name": name, "Tier": TIER_LABEL.get(dtier, dtier),
+                "Placement": placement, "Endpoint": f"http://{CEPH_RGW_ENDPOINT}",
+                "Bucket": name, "Owner": owner,
+                "Access key": k.get("access_key", ""), "Secret key": k.get("secret_key", "")}
 
     @classmethod
-    def nfs_details(cls, base, token, name):
+    def nfs_details(cls, base, token, name, tier="ssd"):
         pseudo = "/" + name
         lst = cls.req(base, token, "GET", "/nfs-ganesha/export", version="1.0")
         cls._ok(lst, 200)
@@ -232,10 +265,13 @@ class CephAPI:
             raise CephAPIError(f"NFS export {pseudo} not found")
         server = CEPH_NFS_SERVER or "<nfs-server>:2049"
         host = server.split(":")[0]
-        return {"_type": "nfs", "name": name, "NFS server": server,
-                "Export (pseudo)": pseudo, "Cluster": CEPH_NFS_CLUSTER,
-                "Export ID": str(match.get("export_id", "")),
-                "Mount command": f"sudo mount -t nfs4 {host}:{pseudo} /mnt/{name}"}
+        d = {"_type": "nfs", "name": name, "Tier": TIER_LABEL.get(tier, tier),
+             "NFS server": server, "Export (pseudo)": pseudo, "Cluster": CEPH_NFS_CLUSTER,
+             "Export ID": str(match.get("export_id", "")), "Backing path": match.get("path", "/"),
+             "Mount command": f"sudo mount -t nfs4 {host}:{pseudo} /mnt/{name}"}
+        if tier == "hdd":
+            d["Data pool"] = CEPHFS_HDD_POOL
+        return d
 
     @classmethod
     def cephfs_details(cls, base, token, name, tier="ssd"):
@@ -283,7 +319,7 @@ class CephAPI:
         if typ == "cephfs":
             return cls.cephfs_details(base, token, name, tier)
         if typ == "nfs":
-            return cls.nfs_details(base, token, name)
+            return cls.nfs_details(base, token, name, tier)
         return cls.rbd_details(base, token, name)
 
     # ── live discovery (list everything that exists in Ceph) ──────────────
@@ -574,14 +610,13 @@ def browse(name):
 @app.route("/browse/<name>/upload", methods=["POST"])
 def browse_upload(name):
     ctx = require_ceph()
-    entry = authorize(ctx, "s3", name)
+    authorize(ctx, "s3", name)
     f = request.files.get("file")
     if f and f.filename:
         try:
+            # Bucket placement (hdd-placement) already pins the tier; no per-object header.
             access, secret, _ = CephAPI.bucket_creds(ctx["base"], ctx["token"], name)
-            extra = {"StorageClass": RGW_HDD_SC} if (entry and entry.get("tier") == "hdd") else {}
-            s3_client_for(access, secret).upload_fileobj(
-                f, name, secure_filename(f.filename), ExtraArgs=extra)
+            s3_client_for(access, secret).upload_fileobj(f, name, secure_filename(f.filename))
         except Exception:  # noqa: BLE001
             pass
     return redirect(url_for("browse", name=name))

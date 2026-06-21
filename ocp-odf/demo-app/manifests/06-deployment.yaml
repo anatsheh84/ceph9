@@ -63,6 +63,8 @@ spec:
               value: "cephfs.cephfs.data.hdd"
             - name: CEPH_RGW_HDD_SC
               value: "HDD"
+            - name: CEPH_RGW_HDD_PLACEMENT
+              value: "hdd-placement"
             - name: CEPH_API_PASSWORD
               valueFrom:
                 secretKeyRef:
