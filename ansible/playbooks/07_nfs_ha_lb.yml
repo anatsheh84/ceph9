@@ -1,0 +1,117 @@
+---
+# ============================================================================
+# Phase 07 (OPTIONAL) — make NFS highly available and front it with an
+# internal AWS Network Load Balancer.
+#
+#   * Scale the nfslab ganesha cluster to N daemons (one per nfs_ha_hosts) —
+#     clustered NFS uses the rados_cluster recovery backend automatically.
+#   * Create an internal NLB (TCP 2049) targeting those hosts, so clients use
+#     one endpoint with health-checked failover.
+#
+# Why NLB and not Ceph's `ingress`: ingress uses keepalived VRRP/VIP, which
+# does not work in an AWS VPC (no gratuitous-ARP/VIP failover). An internal NLB
+# is the AWS-native equivalent.
+#
+# Run with 00 for the inventory:
+#   ansible-playbook playbooks/00_provision_aws.yml playbooks/07_nfs_ha_lb.yml
+#
+# Idempotent + re-runnable.
+# ============================================================================
+
+# ---------- PLAY A: scale ganesha (admin) -----------------------------------
+- name: NFS HA — scale ganesha daemons
+  hosts: admin
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Label nfs_ha_hosts with 'nfs'
+      ansible.builtin.command:
+        cmd: /usr/sbin/cephadm shell -- ceph orch host label add {{ item }} nfs
+      loop: "{{ nfs_ha_hosts }}"
+      register: lbl
+      changed_when: "'Added label' in lbl.stdout"
+      failed_when:
+        - lbl.rc != 0
+        - "'already' not in lbl.stdout + lbl.stderr"
+
+    - name: Wait for {{ nfs_ha_hosts | length }} ganesha daemons running
+      ansible.builtin.shell: |
+        /usr/sbin/cephadm shell -- ceph orch ps --daemon-type nfs --format json 2>/dev/null \
+          | python3 -c "import sys,json;print(sum(1 for d in json.load(sys.stdin) if d.get('status_desc')=='running'))"
+      register: nfs_running
+      until: nfs_running.stdout | int >= (nfs_ha_hosts | length)
+      retries: 30
+      delay: 10
+      changed_when: false
+
+# ---------- PLAY B: internal NLB (localhost / aws cli) ----------------------
+- name: NFS HA — internal NLB
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Resolve VPC / private subnet / SG
+      ansible.builtin.shell: |
+        echo "VPC=$(aws ec2 describe-vpcs --region {{ aws_region }} --filters 'Name=tag:Name,Values={{ project_tag }}-vpc' --query 'Vpcs[0].VpcId' --output text)"
+        echo "SUB=$(aws ec2 describe-subnets --region {{ aws_region }} --filters 'Name=tag:Name,Values={{ project_tag }}-private' --query 'Subnets[0].SubnetId' --output text)"
+        echo "SG=$(aws ec2 describe-security-groups --region {{ aws_region }} --filters 'Name=tag:Name,Values={{ project_tag }}-sg' --query 'SecurityGroups[0].GroupId' --output text)"
+      register: ids_out
+      changed_when: false
+
+    - name: Set infra facts
+      ansible.builtin.set_fact:
+        vpc_id: "{{ ids_out.stdout | regex_search('VPC=(\\S+)', '\\1') | first }}"
+        priv_subnet: "{{ ids_out.stdout | regex_search('SUB=(\\S+)', '\\1') | first }}"
+        ceph_sg: "{{ ids_out.stdout | regex_search('SG=(\\S+)', '\\1') | first }}"
+
+    - name: Resolve instance ids for the ganesha hosts
+      ansible.builtin.shell: >
+        aws ec2 describe-instances --region {{ aws_region }}
+        --filters 'Name=tag:Name,Values={{ item }}' 'Name=instance-state-name,Values=running'
+        --query 'Reservations[0].Instances[0].InstanceId' --output text
+      loop: "{{ nfs_ha_hosts }}"
+      register: nfs_iids
+      changed_when: false
+
+    - name: Create target group + NLB + listener + SG rule (idempotent)
+      ansible.builtin.shell: |
+        set -e
+        REGION={{ aws_region }}
+        TG=$(aws elbv2 create-target-group --region $REGION --name {{ nfs_nlb_tg_name }} \
+              --protocol TCP --port {{ nfs_port }} --vpc-id {{ vpc_id }} --target-type instance \
+              --health-check-protocol TCP --health-check-port {{ nfs_port }} \
+              --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null \
+            || aws elbv2 describe-target-groups --region $REGION --names {{ nfs_nlb_tg_name }} \
+              --query 'TargetGroups[0].TargetGroupArn' --output text)
+        aws elbv2 register-targets --region $REGION --target-group-arn "$TG" \
+          --targets {% for r in nfs_iids.results %}Id={{ r.stdout }} {% endfor %}
+        LB=$(aws elbv2 create-load-balancer --region $REGION --name {{ nfs_nlb_name }} \
+              --type network --scheme internal --subnets {{ priv_subnet }} \
+              --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null \
+            || aws elbv2 describe-load-balancers --region $REGION --names {{ nfs_nlb_name }} \
+              --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+        # listener (create only if none on the port)
+        if ! aws elbv2 describe-listeners --region $REGION --load-balancer-arn "$LB" \
+              --query 'Listeners[?Port==`{{ nfs_port }}`]' --output text | grep -q .; then
+          aws elbv2 create-listener --region $REGION --load-balancer-arn "$LB" \
+            --protocol TCP --port {{ nfs_port }} \
+            --default-actions Type=forward,TargetGroupArn="$TG" >/dev/null
+        fi
+        # SG: allow NFS from the VPC CIDR (NLB health checks)
+        aws ec2 authorize-security-group-ingress --region $REGION --group-id {{ ceph_sg }} \
+          --ip-permissions 'IpProtocol=tcp,FromPort={{ nfs_port }},ToPort={{ nfs_port }},IpRanges=[{CidrIp={{ vpc_cidr }},Description="nlb-nfs"}]' \
+          >/dev/null 2>&1 || true
+        aws elbv2 wait load-balancer-available --region $REGION --load-balancer-arns "$LB"
+        DNS=$(aws elbv2 describe-load-balancers --region $REGION --load-balancer-arns "$LB" --query 'LoadBalancers[0].DNSName' --output text)
+        IP=$(aws ec2 describe-network-interfaces --region $REGION --filters "Name=description,Values=ELB net/{{ nfs_nlb_name }}/*" --query 'NetworkInterfaces[0].PrivateIpAddress' --output text)
+        echo "NLB_DNS=$DNS"
+        echo "NLB_IP=$IP"
+      register: nlb_out
+      changed_when: true
+
+    - name: Show NLB endpoint
+      ansible.builtin.debug:
+        msg: >-
+          NFS NLB ready — clients mount via {{ nlb_out.stdout | regex_search('NLB_IP=(\\S+)', '\\1') | first }}:{{ nfs_port }}
+          (DNS {{ nlb_out.stdout | regex_search('NLB_DNS=(\\S+)', '\\1') | first }}).
+          e.g.  sudo mount -t nfs4 -o minorversion=1 <ip>:/<export> /mnt

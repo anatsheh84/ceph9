@@ -82,3 +82,10 @@ rbd_hdd_pool: rbd-hdd
 cephfs_hdd_data_pool: "cephfs.{{ cephfs_volume }}.data.hdd"
 rgw_hdd_data_pool: default.rgw.buckets.data.hdd
 rgw_hdd_storage_class: HDD
+
+# --- NFS HA + internal NLB (optional — phase 07_nfs_ha_lb) --------------
+# Hosts that run ganesha (get the 'nfs' label). 2+ for HA.
+nfs_ha_hosts: [ceph03, ceph04]
+nfs_port: 2049
+nfs_nlb_name: ceph9-nfs-nlb
+nfs_nlb_tg_name: ceph9-nfs-tg
