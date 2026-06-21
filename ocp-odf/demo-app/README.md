@@ -1,17 +1,30 @@
-# Ceph External Storage Demo app
+# Ceph External Storage Portal
 
-A Red Hat-themed Flask web app that demonstrates the **ocp-external** cluster
-storing and retrieving files from the external **ceph9** cluster across all
-three storage endpoints:
+A Red Hat-themed Flask portal on **ocp-external** that both **consumes** and
+**self-service provisions** storage on the external **ceph9** cluster. Two tabs:
 
-| Endpoint | Backing | How |
-|---|---|---|
-| **Block** | Ceph RBD | RWO PVC `ceph-demo-block` (`ocs-external-storagecluster-ceph-rbd`) mounted at `/data/block` |
-| **File** | CephFS | RWX PVC `ceph-demo-file` (`ocs-external-storagecluster-cephfs`) mounted at `/data/file` |
-| **Object** | Ceph RGW (S3) | `ObjectBucketClaim` `ceph-demo-bucket` (`ocs-external-storagecluster-ceph-rgw`); creds via `envFrom` |
+### 1. Self-Service Provisioning
+- **Log in with Ceph credentials** (mgr/dashboard REST API); connection is verified.
+  Ceph **RBAC** is enforced — admins see/do everything, users only what they created.
+- **Provision on demand** via the Ceph REST API, choosing a **tier**:
+  | Type | Tier0 (SSD) | Tier1 (HDD) | Returns |
+  |---|---|---|---|
+  | **S3** bucket | pool `rbd`/STANDARD | `HDD` storage class | endpoint + access/secret keys |
+  | **NFS** export | nfslab | — | NFS server (NLB) + pseudo-path + mount cmd |
+  | **CephFS** subvolume | default data pool | `…data.hdd` | fs + path + mons |
+  | **RBD** image | `rbd` | `rbd-hdd` | pool + image + size + map cmd |
+- **Live discovery** of everything in Ceph, **retrieve connection details any time**,
+  and **browse / upload / preview** S3 objects.
 
-The UI lets you pick an endpoint, upload a file, and download files back — every
-write lands on ceph9.
+### 2. Consume Mounted Storage
+Pre-provisioned **Block** (RWO RBD PVC), **File** (RWX CephFS PVC), **Object** (OBC
+bucket) — upload / list / download. Every write lands on ceph9.
+
+### HA / endpoints
+The portal targets the **internal NLBs** for the gateway protocols when present
+(`deploy.sh` auto-resolves them): S3 → `ceph9-rgw-nlb:8080`, NFS → `ceph9-nfs-nlb:2049`.
+The mgr REST API is reached by probing the static node IPs (`CEPH_API_HOSTS`); RBD/CephFS
+details use the mon list (`CEPH_MON_HOSTS`).
 
 ## Files
 ```
