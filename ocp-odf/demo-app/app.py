@@ -700,6 +700,8 @@ STYLE = r"""
   .logo{width:46px;height:32px;background:var(--rh-red);border-radius:3px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px}
   header h1{font-size:20px;margin:0}header .sub{color:var(--muted);font-size:13px;margin-top:2px}
   a.back{color:#ff5a5a;text-decoration:none;font-weight:700;font-size:13px}
+  a.navlink{margin-left:auto;color:#fff;text-decoration:none;font-weight:700;font-size:13px;background:var(--rh-red);padding:8px 16px;border-radius:6px}
+  a.navlink:hover{background:var(--rh-red-dark)}
   .wrap{max-width:1100px;margin:0 auto;padding:0 28px 28px}
   .tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:0 0 24px;position:sticky;top:0;background:var(--bg);padding-top:20px}
   .tab{background:none;border:0;color:var(--muted);font-size:15px;font-weight:700;padding:14px 22px;cursor:pointer;border-bottom:3px solid transparent;font-family:inherit}
@@ -748,7 +750,8 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ceph External Storage Portal</title>""" + STYLE + r"""</head><body>
 <header><div class="logo">RH</div><div><h1>Ceph External Storage Portal</h1>
-<div class="sub">OpenShift <code>ocp-external</code> &rarr; external Ceph <code>ceph9</code></div></div></header>
+<div class="sub">OpenShift <code>ocp-external</code> &rarr; external Ceph <code>ceph9</code></div></div>
+<a class="navlink" href="/architecture">Architecture &rarr;</a></header>
 <div class="wrap">
   <div class="tabs">
     <button class="tab" id="tab-provision" onclick="showTab('provision')">Self-Service Provisioning</button>
@@ -869,6 +872,222 @@ BROWSE_PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
           <a class="ghost" href="{{ url_for('browse_object', name=bucket, key=o.key) }}">download</a></td></tr>{% endfor %}</table>
     {% else %}<div class="empty">Bucket is empty.</div>{% endif %}
   </div></div></body></html>
+"""
+
+@app.route("/architecture")
+def architecture():
+    return ARCH_HTML
+
+
+ARCH_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture — Ceph External Storage</title>
+<style>
+  :root{--rh-red:#ee0000;--rh-red-d:#be0000;--bg:#0f0f0f;--panel:#1b1b1b;--panel2:#242424;
+        --line:#3c3c3c;--text:#fff;--muted:#a0a0a0;--ssd:#3b82f6;--hdd:#f0a429;
+        --s3:#ee0000;--nfs:#f0a429;--bf:#3fb6a8;--mgmt:#a679f0;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font-family:"Red Hat Display","Red Hat Text",-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  header{background:#000;border-bottom:4px solid var(--rh-red);padding:16px 26px;display:flex;align-items:center;gap:14px}
+  .logo{width:42px;height:30px;background:var(--rh-red);border-radius:3px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px}
+  header h1{font-size:18px;margin:0}.sub{color:var(--muted);font-size:12px;margin-top:2px}
+  a.back{color:#ff6a6a;text-decoration:none;font-weight:700;font-size:13px;margin-left:auto}
+  .wrap{max-width:1280px;margin:0 auto;padding:18px 22px 40px}
+  .bar{display:flex;flex-wrap:wrap;gap:18px;align-items:center;margin-bottom:16px}
+  .toggles{display:flex;gap:8px;flex-wrap:wrap}
+  .tg{background:var(--panel2);border:1px solid var(--line);color:#fff;border-radius:20px;padding:7px 14px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;display:flex;align-items:center;gap:7px}
+  .tg .d{width:9px;height:9px;border-radius:50%;background:#555}
+  .tg.on{border-color:#777}.tg.on .d{background:#3fb950}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-left:auto}
+  .legend span{display:inline-flex;align-items:center;gap:5px}
+  .lz{width:18px;height:0;border-top:3px solid}
+  .stage{position:relative}
+  #wires{position:absolute;inset:0;width:100%;height:100%;z-index:0;pointer-events:none;overflow:visible}
+  .aws{border:1px dashed #555;border-radius:12px;padding:30px 16px 16px;position:relative;z-index:1}
+  .aws>.tag{position:absolute;top:-11px;left:16px;background:var(--bg);padding:0 8px;color:var(--muted);font-size:12px;font-weight:700}
+  .toprow{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:16px}
+  .vpc{border:1px solid var(--line);border-radius:10px;padding:28px 14px 14px;position:relative;background:#151515;flex:1;min-width:320px}
+  .vpc>.tag{position:absolute;top:-10px;left:14px;background:#151515;padding:0 8px;font-size:12px;font-weight:700}
+  .vpc .meta{color:var(--muted);font-size:11px;margin:-4px 0 12px}
+  .box{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:12px;cursor:pointer;transition:border-color .15s,transform .1s}
+  .box:hover{border-color:#888;transform:translateY(-1px)}
+  .box.sel{border-color:var(--rh-red);box-shadow:0 0 0 1px var(--rh-red) inset}
+  .box .t{font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px;justify-content:space-between}
+  .box .ip{color:var(--muted);font-size:11px;font-family:ui-monospace,monospace}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}
+  .chip{font-size:10px;padding:2px 7px;border-radius:10px;background:#2c2c2c;color:#ddd;border:1px solid #3a3a3a}
+  .chip.ha{background:#10240f;border-color:#1f7a33;color:#9be8ab}
+  .disks{display:flex;gap:5px;margin-top:9px}
+  .disk{font-size:9px;padding:2px 6px;border-radius:4px;font-weight:700;color:#000}
+  .disk.ssd{background:#2c2c2c;color:#9bc2ff;border:1px solid #2c4a7a}
+  .disk.hdd{background:#2c2c2c;color:#f0c069;border:1px solid #7a5a1f}
+  .stage.tiers .disk.ssd{background:var(--ssd);color:#04284f}
+  .stage.tiers .disk.hdd{background:var(--hdd);color:#412402}
+  .lbrow{display:flex;gap:16px;justify-content:center;margin:0 0 16px}
+  .nlb{border:1px solid var(--rh-red);background:#1c1212;border-radius:8px;padding:11px 16px;cursor:pointer;min-width:230px;text-align:center}
+  .nlb .t{font-weight:700;font-size:13px;color:#ff8a8a}.nlb .s{color:var(--muted);font-size:11px;margin-top:2px}
+  .nlb .tag2{font-size:9px;background:var(--rh-red);color:#fff;padding:1px 7px;border-radius:9px;margin-left:6px}
+  .cephvpc>.tag{color:#ff8a8a}
+  .nodes{display:flex;gap:14px;flex-wrap:wrap}
+  .node{flex:1;min-width:230px}
+  .ha-badge{display:none;font-size:9px;background:#1f7a33;color:#fff;padding:1px 6px;border-radius:8px}
+  .stage.ha .ha-badge{display:inline-block}
+  .stage.ha .box .chip.ha,.stage.ha .nlb{box-shadow:0 0 0 1px #3fb950 inset}
+  .edge{fill:none;stroke-width:2.5;opacity:0;transition:opacity .3s}
+  .stage.flows .edge{opacity:.9;stroke-dasharray:7 6;animation:dash 1s linear infinite}
+  @keyframes dash{to{stroke-dashoffset:-26}}
+  .edge-s3{stroke:var(--s3)}.edge-nfs{stroke:var(--nfs)}.edge-bf{stroke:var(--bf)}.edge-mgmt{stroke:var(--mgmt)}
+  .panel{margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;min-height:90px}
+  .panel h3{margin:0 0 8px;font-size:15px;color:#ff8a8a}
+  .panel p{margin:0;color:#ddd;font-size:13px;line-height:1.6}
+  .panel .hint{color:var(--muted);font-size:12px}
+  .foot{color:var(--muted);font-size:11px;text-align:center;margin-top:18px}
+  code{background:#000;padding:1px 5px;border-radius:4px;color:#ff9b9b;font-size:.92em}
+</style></head><body>
+<header><div class="logo">RH</div>
+  <div><h1>Ceph External Storage — Architecture</h1>
+  <div class="sub">AWS · Red Hat Ceph Storage 9 · two OpenShift 4.21 clusters · storage tiers &amp; HA</div></div>
+  <a class="back" href="/?tab=provision">&larr; back to portal</a>
+</header>
+<div class="wrap">
+  <div class="bar">
+    <div class="toggles">
+      <button class="tg on" id="t-flows"><span class="d"></span>Data flows</button>
+      <button class="tg on" id="t-ha"><span class="d"></span>HA components</button>
+      <button class="tg on" id="t-tiers"><span class="d"></span>Storage tiers</button>
+    </div>
+    <div class="legend">
+      <span><span class="lz" style="border-color:var(--s3)"></span>S3</span>
+      <span><span class="lz" style="border-color:var(--nfs)"></span>NFS</span>
+      <span><span class="lz" style="border-color:var(--bf)"></span>RBD/CephFS</span>
+      <span><span class="lz" style="border-color:var(--mgmt)"></span>provisioning API</span>
+      <span><span class="lz" style="border-color:var(--ssd);border-top-style:solid"></span>SSD (gp3)</span>
+      <span><span class="lz" style="border-color:var(--hdd)"></span>HDD (st1)</span>
+    </div>
+  </div>
+
+  <div class="stage flows ha tiers" id="stage">
+    <svg id="wires"></svg>
+    <div class="aws"><span class="tag">AWS · us-east-2</span>
+
+      <div class="toprow">
+        <div class="vpc" style="max-width:430px"><span class="tag">ocp-internal</span>
+          <div class="meta">OCP 4.21 · VPC 10.21.0.0/16</div>
+          <div class="box" data-comp="ocp-internal" id="ocp-internal">
+            <div class="t">ODF — internal mode</div>
+            <div class="chips"><span class="chip">self-contained Ceph in OCP</span><span class="chip">OSDs on gp3</span>
+              <span class="chip">standalone</span></div>
+            <div class="meta" style="margin:9px 0 0">Not connected to ceph9 — independent cluster.</div>
+          </div>
+        </div>
+        <div class="vpc"><span class="tag">ocp-external</span>
+          <div class="meta">OCP 4.21 · VPC 10.22.0.0/16 · peered to ceph9</div>
+          <div class="box" data-comp="webapp" id="webapp">
+            <div class="t">Storage portal (this app) <span class="ha-badge">consumes ceph9</span></div>
+            <div class="chips"><span class="chip">ODF external mode</span><span class="chip">consume + provision</span>
+              <span class="chip">S3 · NFS · CephFS · RBD</span></div>
+            <div class="meta" style="margin:9px 0 0">Talks to ceph9 via the NLBs, mon quorum and mgr API.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="vpc cephvpc"><span class="tag">ceph9 — Red Hat Ceph Storage 9 (cephadm)</span>
+        <div class="meta">VPC 10.20.0.0/16 · 4× m5.2xlarge + bastion/NAT</div>
+
+        <div class="lbrow">
+          <div class="nlb" data-comp="rgw-nlb" id="rgw-nlb">
+            <div class="t">RGW NLB <span class="tag2">LB · we added</span></div>
+            <div class="s">internal NLB · TCP 8080 · seamless failover</div>
+          </div>
+          <div class="nlb" data-comp="nfs-nlb" id="nfs-nlb">
+            <div class="t">NFS NLB <span class="tag2">LB · we added</span></div>
+            <div class="s">internal NLB · TCP 2049 · HA failover</div>
+          </div>
+        </div>
+
+        <div class="nodes">
+          <div class="node box" data-comp="ceph01" id="ceph01">
+            <div class="t">ceph01 <span class="ip">10.20.2.11</span></div>
+            <div class="chips"><span class="chip">_admin</span><span class="chip ha">MON quorum</span>
+              <span class="chip ha">MGR active</span><span class="chip ha">MDS active</span><span class="chip">OSD</span></div>
+            <div class="disks"><span class="disk ssd">SSD</span><span class="disk ssd">SSD</span><span class="disk hdd">HDD</span></div>
+          </div>
+          <div class="node box" data-comp="ceph02" id="ceph02">
+            <div class="t">ceph02 <span class="ip">10.20.2.12</span></div>
+            <div class="chips"><span class="chip ha">MON quorum</span><span class="chip ha">MGR standby</span>
+              <span class="chip">OSD</span><span class="chip ha">RGW</span></div>
+            <div class="disks"><span class="disk ssd">SSD</span><span class="disk ssd">SSD</span><span class="disk hdd">HDD</span></div>
+          </div>
+          <div class="node box" data-comp="ceph03" id="ceph03">
+            <div class="t">ceph03 <span class="ip">10.20.2.13</span></div>
+            <div class="chips"><span class="chip ha">MON quorum</span><span class="chip">OSD</span>
+              <span class="chip ha">RGW</span><span class="chip ha">NFS</span></div>
+            <div class="disks"><span class="disk ssd">SSD</span><span class="disk ssd">SSD</span><span class="disk hdd">HDD</span></div>
+          </div>
+          <div class="node box" data-comp="ceph04" id="ceph04">
+            <div class="t">ceph04 <span class="ip">10.20.2.14</span></div>
+            <div class="chips"><span class="chip">OSD</span><span class="chip ha">MDS standby</span><span class="chip ha">NFS</span></div>
+            <div class="disks"><span class="disk ssd">SSD</span><span class="disk ssd">SSD</span><span class="disk hdd">HDD</span></div>
+          </div>
+        </div>
+        <div class="meta" style="margin-top:12px">
+          Tier0 (ssd): pools <code>rbd</code> · <code>cephfs…data</code> · <code>rgw…data</code> &nbsp;|&nbsp;
+          Tier1 (hdd): <code>rbd-hdd</code> · <code>cephfs…data.hdd</code> · <code>hdd-placement</code> &nbsp;|&nbsp;
+          replica ×3 · 8 ssd + 4 hdd OSDs
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" id="panel">
+    <h3>Click any component</h3>
+    <p class="hint">Select a node, gateway, load balancer or cluster to see what it is and its role in HA &amp; tiering. Use the toggles to highlight data flows, HA components and storage tiers.</p>
+  </div>
+  <div class="foot">Block &amp; file &amp; object all served from ceph9 · RBD/CephFS use the mon quorum directly (native HA) · RGW &amp; NFS sit behind internal AWS NLBs.</div>
+</div>
+<script>
+const INFO={
+ "ocp-internal":["ocp-internal — ODF internal mode","OpenShift 4.21 in its own VPC (10.21.0.0/16). Runs ODF in INTERNAL mode: a self-contained Ceph deployed inside OpenShift, with OSDs on the cluster's own gp3 EBS. It is standalone and does NOT connect to the external ceph9 cluster — it's the contrast case to external mode."],
+ "webapp":["Storage portal (ocp-external)","The Red Hat-themed portal you're using. Runs on ocp-external (ODF external mode). It both CONSUMES ceph9 storage (mounted PVCs / OBC bucket) and SELF-SERVICE PROVISIONS S3, NFS, CephFS and RBD via the Ceph REST API. It reaches ceph9 over VPC peering: S3 and NFS through the internal NLBs, RBD/CephFS through the mon quorum, and provisioning through the mgr API (:8443)."],
+ "rgw-nlb":["RGW NLB — internal load balancer (we added)","An internal AWS Network Load Balancer (TCP 8080) in front of the two RGW S3 gateways (ceph02, ceph03). Health-checked with seamless failover because RGW is stateless. We added this deliberately — Ceph's native 'ingress' uses a keepalived VIP, which cannot float inside an AWS VPC, so an internal NLB is the AWS-native equivalent."],
+ "nfs-nlb":["NFS NLB — internal load balancer (we added)","An internal AWS NLB (TCP 2049) in front of the two NFS-Ganesha gateways (ceph03, ceph04). Provides health-checked failover; because NFS is stateful, failover is recover-with-pause (NFSv4 grace reclaim) rather than fully seamless. Deliberately added (same VPC/keepalived reason as the RGW NLB)."],
+ "ceph01":["ceph01 — m5.2xlarge (10.20.2.11)","Admin node. Hosts a MON (part of the 3-way quorum), the ACTIVE MGR, the ACTIVE MDS, and OSDs. Disks: 2× gp3 SSD (Tier0) + 1× st1 HDD (Tier1). RBD/CephFS clients and the provisioning API talk here."],
+ "ceph02":["ceph02 — m5.2xlarge (10.20.2.12)","MON (quorum), STANDBY MGR, OSDs, and an RGW S3 gateway (behind the RGW NLB). Disks: 2× gp3 SSD + 1× st1 HDD."],
+ "ceph03":["ceph03 — m5.2xlarge (10.20.2.13)","MON (quorum), OSDs, an RGW S3 gateway and an NFS-Ganesha gateway (both behind their NLBs). Disks: 2× gp3 SSD + 1× st1 HDD."],
+ "ceph04":["ceph04 — m5.2xlarge (10.20.2.14)","OSDs, the STANDBY MDS, and an NFS-Ganesha gateway (behind the NFS NLB). Disks: 2× gp3 SSD + 1× st1 HDD."],
+};
+const EDGES=[
+ ["webapp","rgw-nlb","s3"],["rgw-nlb","ceph02","s3"],["rgw-nlb","ceph03","s3"],
+ ["webapp","nfs-nlb","nfs"],["nfs-nlb","ceph03","nfs"],["nfs-nlb","ceph04","nfs"],
+ ["webapp","ceph02","bf"],["webapp","ceph01","mgmt"],
+];
+const stage=document.getElementById("stage"), svg=document.getElementById("wires");
+function pt(el){const r=el.getBoundingClientRect(),s=stage.getBoundingClientRect();
+ return {cx:r.left-s.left+r.width/2, top:r.top-s.top, bot:r.top-s.top+r.height};}
+function draw(){
+ svg.innerHTML="";
+ for(const [a,b,t] of EDGES){
+  const ea=document.getElementById(a), eb=document.getElementById(b); if(!ea||!eb)continue;
+  const A=pt(ea),B=pt(eb); const downward=B.top>=A.bot;
+  const y1=downward?A.bot:A.top, y2=downward?B.top:B.bot;
+  const my=(y1+y2)/2;
+  const p=document.createElementNS("http://www.w3.org/2000/svg","path");
+  p.setAttribute("d",`M ${A.cx} ${y1} C ${A.cx} ${my}, ${B.cx} ${my}, ${B.cx} ${y2}`);
+  p.setAttribute("class","edge edge-"+t);
+  svg.appendChild(p);
+ }
+}
+function tog(id,cls){const b=document.getElementById(id);b.addEventListener("click",()=>{b.classList.toggle("on");stage.classList.toggle(cls);});}
+tog("t-flows","flows");tog("t-ha","ha");tog("t-tiers","tiers");
+let sel=null;
+document.querySelectorAll("[data-comp]").forEach(el=>el.addEventListener("click",()=>{
+ const k=el.getAttribute("data-comp"); if(!INFO[k])return;
+ if(sel)sel.classList.remove("sel"); el.classList.add("sel"); sel=el;
+ document.getElementById("panel").innerHTML="<h3>"+INFO[k][0]+"</h3><p>"+INFO[k][1]+"</p>";
+}));
+window.addEventListener("resize",draw); window.addEventListener("load",draw); setTimeout(draw,120);
+</script></body></html>
 """
 
 if __name__ == "__main__":
