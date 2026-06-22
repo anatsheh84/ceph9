@@ -156,6 +156,17 @@ Each workaround discovered during the manual run is encoded as ansible logic:
    `wait_for_connection`. `aws_infra` scrubs the relevant entries from
    `known_hosts_file` before the first SSH, and `aws_teardown` clears them on
    destroy.
+10. **cephadm-preflight checks phase can hang indefinitely** — the upstream
+    `checks.yml` "Ping all hosts to measure latency" task can wedge on a stale
+    SSH ControlPersist socket (left over from the `rhel_prep` kernel reboot), and
+    neither that task nor the role's wrapping `shell` has a timeout. `cephadm_preflight`
+    now clears stale control sockets, runs the inner playbook with `ControlMaster=no`,
+    and wraps it in `timeout 900`; a timeout (rc 124) is tolerated like the known
+    `infra_pkgs` check failure, so a checks-phase hang can never stall the build.
+11. **Dashboard `ac-user-set-password` flag** — Ceph 9 accepts `--force-password`,
+    not `--force-password-policy` (the latter errors with `EINVAL`, rc 22).
+    `ceph_services` sets the dashboard admin password with the correct flag (and
+    `no_log: true`, so reproduce manually on ceph01 if it ever fails).
 
 ## Layout
 

@@ -112,6 +112,31 @@ source env.sh
   optional opentlc zone (`sandboxNNNN.opentlc.com`) — reuse it here.
 - AWS On-Demand vCPU quota ≥ ~100 in `us-east-2` (two clusters of 3 masters + 3
   workers each).
+- **Elastic IP quota.** Each default 3-AZ IPI cluster creates 3 NAT gateways = 3
+  EIPs; ceph9 uses 1 more. Two 3-AZ clusters + ceph9 = 7 EIPs. If your sandbox EIP
+  quota is the default 5, that won't fit — see the single-AZ note below.
+
+## Operational notes (gotchas seen on a constrained sandbox)
+- **Elastic IP quota → single-AZ.** On a 5-EIP sandbox, the install template
+  (`templates/aws-install-config.yaml.tmpl`) pins control-plane and compute to a
+  single AZ (`zones: [us-east-2a]`) so each cluster uses **one** NAT EIP
+  (ceph9 1 + each cluster 1 = 3 ≤ 5). Drop the `zones:` blocks for full 3-AZ HA
+  once you have ≥ 8 EIPs.
+- **macOS DNS negative cache blocks `openshift-install`.** If a cluster's `api.*`
+  record is queried before it exists, macOS `mDNSResponder` caches the NXDOMAIN
+  for the zone's SOA negative-TTL (the opentlc zone uses 24h). `dig` resolves it
+  but the system resolver (and Go's default cgo resolver) won't, so the installer
+  hangs at "Waiting for the Kubernetes API" even though the API is up. Fix:
+  `export GODEBUG=netdns=go` (forces Go's pure resolver — added to `env.sh`), or
+  `sudo killall -HUP mDNSResponder` to flush. Recover a stuck cluster with
+  `GODEBUG=netdns=go openshift-install wait-for install-complete --dir clusters/<name>`.
+- **ODF external exporter preamble.** Because ceph9 has two CephFS data pools
+  (Tier0 + Tier1 HDD), the rook exporter prints a `WARNING: Multiple data pools`
+  line before its JSON; `odf-external.sh` strips everything before the first `[`
+  so `jq` sees valid JSON.
+- **demo-app build needs no GitHub token for a public repo.** `05-buildconfig.yaml`
+  has no `sourceSecret` — the in-cluster build does an anonymous clone. Re-add a
+  `sourceSecret` (and a PAT in `GITHUB_TOKEN`) only if you point it at a private fork.
 
 ## Credentials
 `env.sh` is the only place real credentials go and is gitignored. Scripts read
