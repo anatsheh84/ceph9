@@ -751,7 +751,8 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>Ceph External Storage Portal</title>""" + STYLE + r"""</head><body>
 <header><div class="logo">RH</div><div><h1>Ceph External Storage Portal</h1>
 <div class="sub">OpenShift <code>ocp-external</code> &rarr; external Ceph <code>ceph9</code></div></div>
-<a class="navlink" href="/architecture">Architecture &rarr;</a></header>
+<a class="navlink" href="/api-methods">How it works &rarr;</a>
+<a class="navlink" href="/architecture" style="margin-left:10px">Architecture &rarr;</a></header>
 <div class="wrap">
   <div class="tabs">
     <button class="tab" id="tab-provision" onclick="showTab('provision')">Self-Service Provisioning</button>
@@ -948,7 +949,8 @@ ARCH_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <header><div class="logo">RH</div>
   <div><h1>Ceph External Storage — Architecture</h1>
   <div class="sub">AWS · Red Hat Ceph Storage 9 · two OpenShift 4.21 clusters · storage tiers &amp; HA</div></div>
-  <a class="back" href="/?tab=provision">&larr; back to portal</a>
+  <a class="back" href="/api-methods" style="margin-left:auto">How it works</a>
+  <a class="back" href="/?tab=provision" style="margin-left:18px">&larr; back to portal</a>
 </header>
 <div class="wrap">
   <div class="bar">
@@ -1089,6 +1091,189 @@ document.querySelectorAll("[data-comp]").forEach(el=>el.addEventListener("click"
 window.addEventListener("resize",draw); window.addEventListener("load",draw); setTimeout(draw,120);
 </script></body></html>
 """
+
+@app.route("/api-methods")
+def api_methods():
+    return APIMETHODS_HTML
+
+
+APIMETHODS_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How it works — Ceph API methods</title>
+<style>
+  :root{--rh-red:#ee0000;--rh-red-d:#be0000;--bg:#0f0f0f;--panel:#1b1b1b;--panel2:#242424;
+        --line:#3c3c3c;--text:#fff;--muted:#a0a0a0;--ctl:#a679f0;--data:#3fb6a8;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font-family:"Red Hat Display","Red Hat Text",-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  header{background:#000;border-bottom:4px solid var(--rh-red);padding:16px 26px;display:flex;align-items:center;gap:14px}
+  .logo{width:42px;height:30px;background:var(--rh-red);border-radius:3px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px}
+  header h1{font-size:18px;margin:0}.sub{color:var(--muted);font-size:12px;margin-top:2px}
+  a.back{color:#ff6a6a;text-decoration:none;font-weight:700;font-size:13px}
+  .wrap{max-width:1280px;margin:0 auto;padding:18px 22px 40px}
+  .intro{color:#ddd;font-size:13px;line-height:1.6;margin:6px 0 16px;max-width:880px}
+  .intro b{color:#fff}
+  .bar{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:18px}
+  .toggles{display:flex;gap:8px;flex-wrap:wrap}
+  .tg{background:var(--panel2);border:1px solid var(--line);color:#fff;border-radius:20px;padding:7px 14px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;display:flex;align-items:center;gap:7px}
+  .tg .d{width:9px;height:9px;border-radius:50%;background:#555}
+  .tg.on .d{background:#3fb950}
+  .tg.ctl.on{border-color:var(--ctl)}.tg.data.on{border-color:var(--data)}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-left:auto;align-items:center}
+  .m{font-weight:800;font-size:10px;padding:2px 7px;border-radius:5px;font-family:ui-monospace,Menlo,monospace}
+  .m.get{background:#0d2c12;color:#9be8ab;border:1px solid #1f7a33}
+  .m.post{background:#2c0d0d;color:#ff9b9b;border:1px solid #7a1f1f}
+  .m.s3{background:#2a210a;color:#f0c069;border:1px solid #7a5a1f}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:18px}
+  .card2{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:pointer;transition:border-color .15s,transform .1s}
+  .card2:hover{border-color:#888;transform:translateY(-1px)}
+  .card2.sel{border-color:var(--rh-red);box-shadow:0 0 0 1px var(--rh-red) inset}
+  .card2 .h{padding:13px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .card2 .h .t{font-weight:700;font-size:14px}
+  .card2 .h .tag{font-size:10px;padding:2px 8px;border-radius:10px;background:#2c2c2c;color:#ddd;border:1px solid #3a3a3a;white-space:nowrap}
+  .card2 ul{list-style:none;margin:0;padding:8px}
+  .card2 li{display:grid;grid-template-columns:auto 1fr auto;gap:5px 9px;align-items:center;padding:8px;border-radius:6px}
+  .card2 li:hover{background:var(--panel2)}
+  .path{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#fff;word-break:break-all}
+  .via{font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:9px;padding:1px 7px;white-space:nowrap}
+  .via.ctl{color:#c9b3f7;border-color:#574a72}.via.data{color:#9fe0d6;border-color:#356158}
+  .desc{grid-column:1 / -1;color:var(--muted);font-size:12px;margin:0}
+  .stage.no-ctl li[data-lane=ctl]{opacity:.22}
+  .stage.no-data li[data-lane=data]{opacity:.22}
+  .panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;min-height:84px}
+  .panel h3{margin:0 0 8px;font-size:15px;color:#ff8a8a}
+  .panel p{margin:0;color:#ddd;font-size:13px;line-height:1.65}
+  .panel .hint{color:var(--muted);font-size:12px}
+  .foot{color:var(--muted);font-size:11px;text-align:center;margin-top:20px}
+  code{background:#000;padding:1px 5px;border-radius:4px;color:#ff9b9b;font-size:.92em}
+</style></head><body>
+<header><div class="logo">RH</div>
+  <div><h1>How it works — Ceph API methods</h1>
+  <div class="sub">What the portal actually calls on <code>ceph9</code> under the hood</div></div>
+  <a class="back" href="/architecture" style="margin-left:auto">Architecture</a>
+  <a class="back" href="/?tab=provision" style="margin-left:18px">&larr; back to portal</a>
+</header>
+<div class="wrap">
+  <p class="intro">Every action in the portal maps to a real API call on the external Ceph cluster. Control-plane
+  actions (create/list) go to the <b>Ceph Manager REST API</b> over HTTPS on <code>:8443</code> with a per-session
+  bearer token — Ceph's own RBAC decides what you can do. Data-plane actions (objects, mounts) flow through the
+  <b>internal NLBs</b> and ODF's CSI drivers. Click a card for the why.</p>
+
+  <div class="bar">
+    <div class="toggles">
+      <button class="tg ctl on" id="t-ctl"><span class="d"></span>Control plane · mgr REST API</button>
+      <button class="tg data on" id="t-data"><span class="d"></span>Data plane · S3 / NFS / RBD</button>
+    </div>
+    <div class="legend">
+      <span><span class="m get">GET</span>&nbsp;read</span>
+      <span><span class="m post">POST</span>&nbsp;create</span>
+      <span><span class="m s3">S3</span>&nbsp;object op</span>
+    </div>
+  </div>
+
+  <div class="stage" id="stage">
+  <div class="grid">
+
+    <div class="card2" data-comp="connect">
+      <div class="h"><span class="t">1 · Connect &amp; authenticate</span><span class="tag">auth</span></div>
+      <ul>
+        <li data-lane="ctl"><span class="m post">POST</span><span class="path">/api/auth</span><span class="via ctl">mgr API</span>
+          <p class="desc">Exchange your Ceph username + password for a short-lived bearer token used by every later call.</p></li>
+      </ul>
+    </div>
+
+    <div class="card2" data-comp="s3">
+      <div class="h"><span class="t">Provision · S3 bucket</span><span class="tag">object</span></div>
+      <ul>
+        <li data-lane="ctl"><span class="m post">POST</span><span class="path">/api/rgw/user</span><span class="via ctl">mgr API</span>
+          <p class="desc">Create an RGW user and return its S3 access / secret keys.</p></li>
+        <li data-lane="data"><span class="m s3">S3</span><span class="path">CreateBucket</span><span class="via data">RGW NLB</span>
+          <p class="desc">Create the bucket on the RGW gateway; Tier1 pins it to <code>:hdd-placement</code>.</p></li>
+      </ul>
+    </div>
+
+    <div class="card2" data-comp="nfs">
+      <div class="h"><span class="t">Provision · NFS export</span><span class="tag">file</span></div>
+      <ul>
+        <li data-lane="ctl"><span class="m post">POST</span><span class="path">/api/cephfs/subvolume</span><span class="via ctl">mgr API</span>
+          <p class="desc">Tier1 only — carve a CephFS subvolume on the HDD data pool.</p></li>
+        <li data-lane="ctl"><span class="m get">GET</span><span class="path">/api/cephfs/subvolume/{fs}/info</span><span class="via ctl">mgr API</span>
+          <p class="desc">Resolve the subvolume's on-disk path to export.</p></li>
+        <li data-lane="ctl"><span class="m post">POST</span><span class="path">/api/nfs-ganesha/export</span><span class="via ctl">mgr API</span>
+          <p class="desc">Publish an NFSv4 export (pseudo <code>/name</code>) on the <code>nfslab</code> cluster.</p></li>
+      </ul>
+    </div>
+
+    <div class="card2" data-comp="cephfs">
+      <div class="h"><span class="t">Provision · CephFS subvolume</span><span class="tag">file</span></div>
+      <ul>
+        <li data-lane="ctl"><span class="m post">POST</span><span class="path">/api/cephfs/subvolume</span><span class="via ctl">mgr API</span>
+          <p class="desc">Create a subvolume; Tier1 sets <code>pool_layout</code> to the HDD data pool.</p></li>
+      </ul>
+    </div>
+
+    <div class="card2" data-comp="rbd">
+      <div class="h"><span class="t">Provision · RBD image</span><span class="tag">block</span></div>
+      <ul>
+        <li data-lane="ctl"><span class="m post">POST</span><span class="path">/api/block/image</span><span class="via ctl">mgr API</span>
+          <p class="desc">Create a block image in pool <code>rbd</code> (Tier0) or <code>rbd-hdd</code> (Tier1).</p></li>
+      </ul>
+    </div>
+
+    <div class="card2" data-comp="discover">
+      <div class="h"><span class="t">Live discovery &amp; details</span><span class="tag">read-only</span></div>
+      <ul>
+        <li data-lane="ctl"><span class="m get">GET</span><span class="path">/api/rgw/bucket · /api/rgw/user/{uid}</span><span class="via ctl">mgr API</span>
+          <p class="desc">List buckets &amp; resolve owners / S3 keys.</p></li>
+        <li data-lane="ctl"><span class="m get">GET</span><span class="path">/api/nfs-ganesha/export</span><span class="via ctl">mgr API</span>
+          <p class="desc">List NFS exports and their backing paths.</p></li>
+        <li data-lane="ctl"><span class="m get">GET</span><span class="path">/api/block/image · /api/cephfs/subvolume/{fs}/info</span><span class="via ctl">mgr API</span>
+          <p class="desc">List RBD images &amp; CephFS subvolumes; read each one's tier back live.</p></li>
+      </ul>
+    </div>
+
+    <div class="card2" data-comp="consume">
+      <div class="h"><span class="t">Consume mounted storage</span><span class="tag">data path</span></div>
+      <ul>
+        <li data-lane="data"><span class="m s3">S3</span><span class="path">ListObjects · PutObject · GetObject</span><span class="via data">RGW NLB</span>
+          <p class="desc">Browse / upload / download bucket objects (API-accessed, never mounted).</p></li>
+        <li data-lane="data"><span class="m s3">PVC</span><span class="path">Block (RBD) &amp; File (CephFS)</span><span class="via data">ODF CSI</span>
+          <p class="desc">Mounted as Kubernetes PVCs that ODF's external CSI drivers bind against ceph9.</p></li>
+      </ul>
+    </div>
+
+  </div>
+  </div>
+
+  <div class="panel" id="panel">
+    <h3>Click any card</h3>
+    <p class="hint">See the why behind each set of calls. Use the toggles above to highlight control-plane (mgr API) vs data-plane (S3 / NFS / RBD) traffic.</p>
+  </div>
+  <div class="foot">All calls target the external Ceph cluster (ceph9) · control plane = mgr REST API (:8443) · data plane = internal NLBs + ODF CSI · nothing is cached, everything is re-read live.</div>
+</div>
+<script>
+const INFO={
+ "connect":["1 · Connect & authenticate","The portal holds no Ceph credentials. Each session it POSTs your username/password to the mgr API (https://<mon>:8443/api/auth), trying each monitor until one answers, and keeps only the returned bearer token. Every later call carries that token, so Ceph's own RBAC decides what you can see and do — admins see everything, users see only what they created."],
+ "s3":["Provision · S3 bucket (object)","Object storage is a two-step: the RGW user (and its S3 keys) is created through the mgr API, then the bucket itself is created with a real S3 call to the RGW gateway through the NLB — which is where the Tier1 'hdd-placement' target gets selected. The portal then reads the bucket's live placement back to confirm its tier."],
+ "nfs":["Provision · NFS export (file)","For Tier1 a CephFS subvolume is carved on the HDD data pool first, then its path is resolved; finally an NFSv4 export is published on the 'nfslab' Ganesha cluster. Clients mount it through the internal NFS NLB on :2049, so a gateway failover is transparent to the mount target."],
+ "cephfs":["Provision · CephFS subvolume (file)","A CephFS subvolume is a slice of the shared file system. Tier1 sets pool_layout to the HDD data pool so its bytes land on st1 disks. Consume it in-cluster via the cephfs StorageClass (RWX PVC), or re-export it over NFS for external clients."],
+ "rbd":["Provision · RBD image (block)","A block image is created in the rbd pool (Tier0) or the rbd-hdd pool (Tier1). It's consumed in-cluster as a block PVC (RWO) through ODF's ceph-rbd StorageClass; a raw 'rbd map' would need a cephx key."],
+ "discover":["Live discovery & details (read-only)","Nothing is cached — the resource list and every 'details' view are re-read live from Ceph each time. A user without rights to a resource type simply gets a 403, which the portal treats as 'hide it', so users see only what they own while admins see all. Each item's tier is read back from its actual placement rule / pool, not remembered from creation."],
+ "consume":["Consume mounted storage","Two different models side by side: object storage is API-accessed (S3 list/put/get straight to the RGW NLB, never mounted), while block and file are genuine Kubernetes PVCs that ODF's external CSI drivers bind against ceph9 — the app just reads and writes the mountpoint."],
+};
+const stage=document.getElementById("stage");
+function tog(id,cls){const b=document.getElementById(id);b.addEventListener("click",()=>{b.classList.toggle("on");stage.classList.toggle(cls,!b.classList.contains("on"));});}
+tog("t-ctl","no-ctl");tog("t-data","no-data");
+let sel=null;
+document.querySelectorAll("[data-comp]").forEach(el=>el.addEventListener("click",()=>{
+ const k=el.getAttribute("data-comp"); if(!INFO[k])return;
+ if(sel)sel.classList.remove("sel"); el.classList.add("sel"); sel=el;
+ document.getElementById("panel").innerHTML="<h3>"+INFO[k][0]+"</h3><p>"+INFO[k][1]+"</p>";
+ document.getElementById("panel").scrollIntoView({behavior:"smooth",block:"nearest"});
+}));
+</script></body></html>
+"""
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
