@@ -6,8 +6,9 @@
 #
 # It will:
 #   1) write a /etc/hosts block on the bastion so port-forwards resolve ceph01..04
-#   2) fetch the dashboard bootstrap password and S3 lab-user keys
-#   3) print URL + credentials cheat-sheet
+#   2) fetch the dashboard password (build-set or bootstrap) and S3 lab-user keys
+#   3) print URL + credentials cheat-sheet — incl. OpenShift console URLs +
+#      kubeadmin creds and the storage-portal URL when ocp-odf clusters exist
 #   4) open SSH tunnels: 8443 (Dashboard), 3000 (Grafana), 8080 (S3), 2049 (NFS)
 #
 # Usage:
@@ -24,6 +25,10 @@ set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROV="${REPO_ROOT}/.provisioned.json"
+# ocp-odf/ sits alongside ansible/ in the repo; clusters/<name>/auth holds the
+# kubeconfig + kubeadmin-password for each OpenShift cluster (gitignored).
+OCP_ODF_DIR="${REPO_ROOT}/../ocp-odf"
+CLUSTERS_DIR="${OCP_ODF_DIR}/clusters"
 KEY="${KEY:-$HOME/.ssh/ceph9-lab.pem}"
 KNOWN_HOSTS="${HOME}/.ssh/ceph9-known_hosts"
 PIDFILE="/tmp/ceph9-tunnel.pid"
@@ -140,6 +145,49 @@ fetch_credentials() {
   HEALTH=$(ssh_ceph "$bast" 10.20.2.11 "sudo /usr/sbin/cephadm shell -- ceph health 2>/dev/null" 2>/dev/null | tr -d '\r' || echo "unknown")
 }
 
+# Discover OpenShift console URLs/creds and the storage-portal route from the
+# ocp-odf clusters/ dir. Sets OCP_SECTION and APP_SECTION (empty when absent),
+# which print_cheat_sheet interpolates. Safe on a ceph-only build.
+fetch_openshift_info() {
+  OCP_SECTION=""
+  APP_SECTION=""
+  [ -d "$CLUSTERS_DIR" ] || return 0
+  echo "discovering OpenShift clusters + storage portal..."
+  local nl body d cname console kpw ilog
+  nl=$'\n'
+  body=""
+  for d in "$CLUSTERS_DIR"/*/; do
+    [ -f "${d}auth/kubeadmin-password" ] || continue
+    cname=$(basename "$d")
+    ilog="${d}.openshift_install.log"
+    console=""
+    [ -f "$ilog" ] && console=$(grep -oE 'https://console-openshift-console[^ "]+' "$ilog" 2>/dev/null | tail -1)
+    [ -z "$console" ] && console="https://console-openshift-console.apps.${cname}.${AWS_BASE_DOMAIN:-<base-domain>}"
+    kpw=$(cat "${d}auth/kubeadmin-password" 2>/dev/null || echo "(see ${d}auth/kubeadmin-password)")
+    body="${body}  ${cname}${nl}    Console : ${console}${nl}    Login   : kubeadmin / ${kpw}${nl}${nl}"
+  done
+  if [ -n "$body" ]; then
+    OCP_SECTION="${nl}----------------------------------------------------------------------${nl}  > OPENSHIFT CLUSTERS${nl}----------------------------------------------------------------------${nl}${body}"
+  fi
+
+  # Storage portal (demo-app) runs on the external cluster.
+  local ext extkube host capps
+  ext="${EXT_NAME:-ocp-external}"
+  extkube="${CLUSTERS_DIR}/${ext}/auth/kubeconfig"
+  host=""
+  if [ -f "$extkube" ] && command -v oc >/dev/null 2>&1; then
+    host=$(KUBECONFIG="$extkube" oc -n ceph-demo get route ceph-demo-app \
+             --request-timeout=5s -o jsonpath='{.spec.host}' 2>/dev/null || true)
+  fi
+  if [ -z "$host" ] && [ -f "${CLUSTERS_DIR}/${ext}/.openshift_install.log" ]; then
+    capps=$(grep -oE 'apps\.[^ "/]+' "${CLUSTERS_DIR}/${ext}/.openshift_install.log" 2>/dev/null | tail -1)
+    [ -n "$capps" ] && host="ceph-demo-app-ceph-demo.${capps}"
+  fi
+  if [ -n "$host" ]; then
+    APP_SECTION="${nl}----------------------------------------------------------------------${nl}  > STORAGE PORTAL (demo-app)  ->  https://${host}${nl}----------------------------------------------------------------------${nl}  Provision-tab login: admin / ${DASH_PW}${nl}"
+  fi
+}
+
 print_cheat_sheet() {
   local bast="$1"
   cat <<EOF
@@ -176,7 +224,7 @@ print_cheat_sheet() {
   ▶ NFS export (CephFS)
 ----------------------------------------------------------------------
   Mount: sudo mount -t nfs4 localhost:/cephfs /mnt/nfs
-
+${OCP_SECTION}${APP_SECTION}
 ======================================================================
 EOF
 }
@@ -260,6 +308,7 @@ case "$WHAT" in
     BAST=$(bastion_ip)
     echo "bastion: ${BAST}"
     fetch_credentials "$BAST"
+    fetch_openshift_info
     print_cheat_sheet "$BAST"
     exit 0
     ;;
@@ -274,6 +323,7 @@ echo "bastion: ${BAST}"
 
 ensure_bastion_hosts_file "$BAST"
 fetch_credentials "$BAST"
+fetch_openshift_info
 print_cheat_sheet "$BAST"
 
 open_tunnel "$WHAT" "$BAST"
