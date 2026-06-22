@@ -61,16 +61,27 @@
 # >>> Lesson learned: cephadm-ansible 5.0.2 also references undefined
 # >>> `client_group` and `infra_pkgs`. We pass `client_group=clients` and
 # >>> tolerate the `infra_pkgs` failure inside an informational "checks" task.
+# >>> Lesson learned: the upstream checks.yml "Ping all hosts to measure latency"
+# >>> task can wedge on a stale SSH ControlPersist socket (left over from the
+# >>> kernel reboot in rhel_prep), and neither that task nor this shell has a
+# >>> timeout — so the whole build hangs indefinitely. Two guards:
+# >>>   1) ControlMaster=no + clearing stale control sockets avoids the wedge;
+# >>>   2) `timeout` bounds the run so a hang in the informational checks phase
+# >>>      can never stall the build. By the time the checks phase runs, the real
+# >>>      preflight work (packages/podman/chrony) is already done, so a timeout
+# >>>      (rc 124) is tolerated exactly like the known infra_pkgs check failure.
 - name: Run cephadm-preflight playbook (as ec2-user so its SSH keys are used)
   ansible.builtin.shell: |
     cd /usr/share/cephadm-ansible
-    ansible-playbook -i hosts cephadm-preflight.yml \
+    rm -f ~/.ansible/cp/* 2>/dev/null || true
+    ANSIBLE_SSH_ARGS='-o ControlMaster=no -o ControlPath=none -o ServerAliveInterval=15 -o ServerAliveCountMax=4' \
+    timeout 900 ansible-playbook -i hosts cephadm-preflight.yml \
       --extra-vars "ceph_origin=rhcs client_group=clients" \
       -u ec2-user --become 2>&1
   register: preflight
   become: false
   failed_when: >-
-    preflight.rc != 0 and
+    preflight.rc not in [0, 124] and
     'infra_pkgs' not in preflight.stdout and
     'Determine Package Installation Check Result' not in preflight.stdout
   changed_when: "'changed=' in (preflight.stdout | regex_search('ceph01.*'))"

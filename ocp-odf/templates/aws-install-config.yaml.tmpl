@@ -9,6 +9,8 @@ controlPlane:
   platform:
     aws:
       type: ${CONTROL_PLANE_TYPE}
+      zones:
+        - us-east-2a
       rootVolume:
         size: 120
         type: gp3
@@ -21,6 +23,8 @@ compute:
     platform:
       aws:
         type: ${WORKER_TYPE}
+        zones:
+          - us-east-2a
         rootVolume:
           size: 120
           type: gp3

@@ -109,6 +109,9 @@ ssh_ceph "sudo /usr/sbin/cephadm shell --mount /home/ec2-user/exporter.py -- \
     --cephfs-filesystem-name ${CEPH_FS_NAME} \
     --rgw-endpoint ${CEPH_RGW_ENDPOINT} \
     --v2-port-enable 2>/dev/null" > "${JSON_OUT}" 2>/dev/null
+# ceph9's two-tier CephFS (data + data.hdd) makes the exporter print a WARNING
+# preamble before the JSON; keep only from the first '[' so jq sees valid JSON.
+awk 'f||/^\[/{f=1;print}' "${JSON_OUT}" > "${JSON_OUT}.clean" && mv "${JSON_OUT}.clean" "${JSON_OUT}"
 jq -e 'type=="array" and length>0' "${JSON_OUT}" >/dev/null \
   || fail "exporter did not produce valid JSON (see ${JSON_OUT})"
 ok "Connection JSON written ($(jq length "${JSON_OUT}") resources): ${JSON_OUT}"

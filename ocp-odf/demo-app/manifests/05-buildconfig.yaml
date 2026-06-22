@@ -15,9 +15,7 @@ spec:
       uri: https://github.com/anatsheh84/ceph9.git
       ref: main
     contextDir: ocp-odf/demo-app
-    # private repo → in-cluster build authenticates with this secret
-    sourceSecret:
-      name: github-source-secret
+    # repo is public → anonymous clone; no sourceSecret needed
   strategy:
     type: Docker
     dockerStrategy:
