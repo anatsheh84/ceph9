@@ -111,10 +111,21 @@ fetch_credentials() {
   local bast="$1"
   echo "fetching dashboard password and S3 keys (via bastion)..."
 
-  DASH_PW=$(ssh_ceph "$bast" 10.20.2.11 \
-    "sudo grep -oE 'Password: [A-Za-z0-9]+' /var/log/ceph/cephadm.log 2>/dev/null | tail -1 | awk '{print \$2}'" \
-    2>/dev/null || true)
-  [ -z "$DASH_PW" ] && DASH_PW="(check /var/log/ceph/cephadm.log on ceph01)"
+  # The build's ceph_services phase resets the dashboard admin password to
+  # $CEPH_DASHBOARD_PASSWORD when that env var is set, superseding the random
+  # bootstrap password that lands in cephadm.log. Prefer the env var so the
+  # printed credential matches what actually authenticates; fall back to the
+  # log scrape (the bootstrap password) only when it is unset.
+  if [ -n "${CEPH_DASHBOARD_PASSWORD:-}" ]; then
+    DASH_PW="$CEPH_DASHBOARD_PASSWORD"
+    DASH_PW_NOTE='Note: dashboard password was set from $CEPH_DASHBOARD_PASSWORD during the build (no forced change on first login).'
+  else
+    DASH_PW=$(ssh_ceph "$bast" 10.20.2.11 \
+      "sudo grep -oE 'Password: [A-Za-z0-9]+' /var/log/ceph/cephadm.log 2>/dev/null | tail -1 | awk '{print \$2}'" \
+      2>/dev/null || true)
+    [ -z "$DASH_PW" ] && DASH_PW="(check /var/log/ceph/cephadm.log on ceph01)"
+    DASH_PW_NOTE='Note: Ceph forces a password change on first dashboard login.'
+  fi
 
   LABUSER_JSON=$(ssh_ceph "$bast" 10.20.2.11 '
     if sudo /usr/sbin/cephadm shell -- radosgw-admin user info --uid=labuser --format=json 2>/dev/null > /tmp/labuser.json; then :;
@@ -147,7 +158,7 @@ print_cheat_sheet() {
   Dashboard :  https://localhost:8443/    (admin / ${DASH_PW})
   Grafana   :  http://localhost:3000/     (admin / ${DASH_PW})
 
-  Note: Ceph forces a password change on first dashboard login.
+  ${DASH_PW_NOTE}
 
 ----------------------------------------------------------------------
   ▶ S3 (RGW) endpoint  →  http://localhost:8080
