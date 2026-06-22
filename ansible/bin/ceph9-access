@@ -31,6 +31,9 @@ OCP_ODF_DIR="${REPO_ROOT}/../ocp-odf"
 CLUSTERS_DIR="${OCP_ODF_DIR}/clusters"
 KEY="${KEY:-$HOME/.ssh/ceph9-lab.pem}"
 KNOWN_HOSTS="${HOME}/.ssh/ceph9-known_hosts"
+# Cache of the last dashboard password we verified against the live API, so the
+# correct password is shown in later runs even without CEPH_DASHBOARD_PASSWORD set.
+DASH_CACHE="${HOME}/.ceph9-dashboard-pw"
 PIDFILE="/tmp/ceph9-tunnel.pid"
 LOGFILE="/tmp/ceph9-tunnel.log"
 
@@ -112,24 +115,58 @@ HOSTS
   echo "  ok"
 }
 
+# Return 0 if (admin / $3) authenticates against the dashboard API at $2.
+# Runs the curl on ceph01 (which can reach the active mgr's :8443 over the
+# private subnet). The password is injected as a single-quoted remote var so
+# special characters can't break the remote script.
+verify_dash_pw() {
+  local bast="$1" url="$2" pw="$3" safe
+  [ -z "$pw" ] && return 1
+  safe=${pw//\'/\'\\\'\'}   # ' -> '\'' for safe single-quoting on the remote
+  { printf "PW='%s'\nURL='%s'\n" "$safe" "$url"
+    cat <<'EOS'
+code=$(curl -sk -o /dev/null -w '%{http_code}' "$URL/api/auth" \
+  -H 'Accept: application/vnd.ceph.api.v1.0+json' -H 'Content-Type: application/json' \
+  -d "{\"username\":\"admin\",\"password\":\"$PW\"}")
+[ "$code" = 200 ] || [ "$code" = 201 ]
+EOS
+  } | ssh_ceph "$bast" 10.20.2.11 bash -s >/dev/null 2>&1
+}
+
 fetch_credentials() {
   local bast="$1"
   echo "fetching dashboard password and S3 keys (via bastion)..."
 
   # The build's ceph_services phase resets the dashboard admin password to
-  # $CEPH_DASHBOARD_PASSWORD when that env var is set, superseding the random
-  # bootstrap password that lands in cephadm.log. Prefer the env var so the
-  # printed credential matches what actually authenticates; fall back to the
-  # log scrape (the bootstrap password) only when it is unset.
-  if [ -n "${CEPH_DASHBOARD_PASSWORD:-}" ]; then
-    DASH_PW="$CEPH_DASHBOARD_PASSWORD"
-    DASH_PW_NOTE='Note: dashboard password was set from $CEPH_DASHBOARD_PASSWORD during the build (no forced change on first login).'
+  # $CEPH_DASHBOARD_PASSWORD, so the random bootstrap password in cephadm.log is
+  # usually stale. Instead of guessing, VERIFY candidates against the live
+  # dashboard API and show the one that actually authenticates. Order: env var,
+  # then a previously-verified cached value, then the bootstrap password.
+  local dash_url boot_pw cache_pw cand
+  dash_url=$(ssh_ceph "$bast" 10.20.2.11 \
+    "sudo /usr/sbin/cephadm shell -- ceph mgr services 2>/dev/null | grep -oE 'https://[0-9.]+:8443' | head -1" \
+    2>/dev/null | tr -d '\r' || true)
+  [ -z "$dash_url" ] && dash_url="https://10.20.2.11:8443"
+  boot_pw=$(ssh_ceph "$bast" 10.20.2.11 \
+    "sudo grep -oE 'Password: [A-Za-z0-9]+' /var/log/ceph/cephadm.log 2>/dev/null | tail -1 | awk '{print \$2}'" \
+    2>/dev/null | tr -d '\r' || true)
+  cache_pw=""; [ -f "$DASH_CACHE" ] && cache_pw=$(cat "$DASH_CACHE" 2>/dev/null || true)
+
+  DASH_PW=""; DASH_PW_NOTE=""
+  for cand in "${CEPH_DASHBOARD_PASSWORD:-}" "$cache_pw" "$boot_pw"; do
+    [ -z "$cand" ] && continue
+    if verify_dash_pw "$bast" "$dash_url" "$cand"; then DASH_PW="$cand"; break; fi
+  done
+  if [ -n "$DASH_PW" ]; then
+    if [ "$DASH_PW" = "${boot_pw:-__none__}" ]; then
+      DASH_PW_NOTE='Note: verified — bootstrap password; Ceph forces a change on first dashboard login.'
+    else
+      DASH_PW_NOTE='Note: verified live against the dashboard API.'
+      ( umask 077; printf '%s' "$DASH_PW" > "$DASH_CACHE" ) 2>/dev/null || true
+    fi
   else
-    DASH_PW=$(ssh_ceph "$bast" 10.20.2.11 \
-      "sudo grep -oE 'Password: [A-Za-z0-9]+' /var/log/ceph/cephadm.log 2>/dev/null | tail -1 | awk '{print \$2}'" \
-      2>/dev/null || true)
-    [ -z "$DASH_PW" ] && DASH_PW="(check /var/log/ceph/cephadm.log on ceph01)"
-    DASH_PW_NOTE='Note: Ceph forces a password change on first dashboard login.'
+    DASH_PW="${CEPH_DASHBOARD_PASSWORD:-${boot_pw:-(check /var/log/ceph/cephadm.log on ceph01)}}"
+    DASH_PW_NOTE='Note: could NOT verify any known password against the dashboard API — it was likely reset at build time. Re-run with CEPH_DASHBOARD_PASSWORD exported (the value passed to the ansible build).'
   fi
 
   LABUSER_JSON=$(ssh_ceph "$bast" 10.20.2.11 '
