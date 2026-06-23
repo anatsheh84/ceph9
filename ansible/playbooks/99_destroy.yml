@@ -2,6 +2,8 @@
 - name: Teardown AWS infrastructure
   hosts: localhost
   gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventory/topologies/{{ ceph_topology }}.yml"
   connection: local
   roles:
     - aws_teardown

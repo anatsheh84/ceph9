@@ -22,6 +22,8 @@
   hosts: admin
   become: true
   gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventory/topologies/{{ ceph_topology }}.yml"
   tasks:
     - name: Stop cephadm auto-consuming new devices
       ansible.builtin.command:
@@ -54,6 +56,8 @@
   hosts: localhost
   connection: local
   gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventory/topologies/{{ ceph_topology }}.yml"
   tasks:
     - name: Create + attach one st1 volume per ceph node (idempotent)
       ansible.builtin.shell: |
@@ -92,6 +96,8 @@
   hosts: admin
   become: true
   gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventory/topologies/{{ ceph_topology }}.yml"
   vars:
     expected_osds: "{{ (ceph_nodes | length) * (osd_disks_per_node + 1) }}"
     hdd_osd_min: "{{ (ceph_nodes | length) * osd_disks_per_node }}"   # ids >= this = Tier1

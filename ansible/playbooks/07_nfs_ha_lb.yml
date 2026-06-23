@@ -24,6 +24,8 @@
   hosts: admin
   become: true
   gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventory/topologies/{{ ceph_topology }}.yml"
   tasks:
     - name: Label nfs_ha_hosts with 'nfs'
       ansible.builtin.command:
@@ -50,6 +52,8 @@
   hosts: localhost
   connection: local
   gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventory/topologies/{{ ceph_topology }}.yml"
   tasks:
     - name: Resolve VPC / private subnet / SG
       ansible.builtin.shell: |

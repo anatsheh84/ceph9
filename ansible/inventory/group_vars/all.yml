@@ -46,15 +46,9 @@ bastion_instance_type: t3.large
 ceph_instance_type:    m5.2xlarge
 bastion_root_gb: 30
 ceph_root_gb:    60
-osd_disk_gb:     500
-osd_disks_per_node: 2          # → 8 OSDs total → ~1 TB usable @ replica 3
-
-# Per-node static IPs (4 nodes). 4-node minimum per RHCS9 Install Guide §2.
-ceph_nodes:
-  - { name: ceph01, ip: 10.20.2.11, labels: [_admin, mon, mgr, osd, mds] }
-  - { name: ceph02, ip: 10.20.2.12, labels: [mon, mgr, osd, rgw] }
-  - { name: ceph03, ip: 10.20.2.13, labels: [mon, osd, rgw, nfs] }
-  - { name: ceph04, ip: 10.20.2.14, labels: [osd, mds] }
+# OSD layout (osd_disk_gb / osd_disks_per_node / osd_data_device) and the node
+# list (ceph_nodes) are topology-specific and now live in the selected profile
+# inventory/topologies/{{ ceph_topology }}.yml (loaded per play via vars_files).
 
 # --- DNS (optional) -----------------------------------------------------
 # Pass via -e or env. Leave empty to skip Route 53 registration entirely.
@@ -70,13 +64,12 @@ rhel_repos:
   - rhel-9-for-x86_64-appstream-rpms
   - rhceph-9-tools-for-rhel-9-x86_64-rpms
 
-# --- Ceph services ------------------------------------------------------
+# --- Ceph services (shared across topologies) ---------------------------
+# Topology-specific pool/filesystem names (cephfs_volume, rbd_pool_name, …) live
+# in the topology profile. These base service knobs are shared by both.
 rgw_service_name: s3lab
 rgw_port: 8080
 nfs_cluster_name: nfslab
-cephfs_volume: cephfs
-rbd_pool_name: rbd
-rbd_pool_pg_num: 32
 
 # Ceph dashboard / mgr REST API admin password — consumed by the demo-app's
 # self-service provisioning. Set CEPH_DASHBOARD_PASSWORD in the env so a rebuild
@@ -84,30 +77,8 @@ rbd_pool_pg_num: 32
 # stands and the app must be reconfigured). Empty = leave bootstrap password.
 ceph_dashboard_password: "{{ lookup('env','CEPH_DASHBOARD_PASSWORD') | default('', true) }}"
 
-# --- Storage tiers (optional — phase 06_storage_tiers) ------------------
-# Tier0 = existing gp3 OSDs (device class 'ssd'); Tier1 = new st1 HDD OSDs
-# (device class 'hdd', set manually since EBS always reports non-rotational).
-hdd_disk_type: st1            # throughput-optimized HDD (cost-optimized tier)
-hdd_disk_gb: 500
-hdd_device: /dev/sdd          # next free slot after the 2 gp3 OSD disks
-tier_pg_num: 32
-rbd_hdd_pool: rbd-hdd
-cephfs_hdd_data_pool: "cephfs.{{ cephfs_volume }}.data.hdd"
-rgw_hdd_data_pool: default.rgw.buckets.data.hdd
-rgw_hdd_storage_class: HDD
-
-# --- HA endpoints: NFS + RGW behind internal NLBs (phase 07_nfs_ha_lb) ---
-# Hosts that run ganesha (get the 'nfs' label). 2+ for HA.
-nfs_ha_hosts: [ceph03, ceph04]
-nfs_port: 2049
-nfs_nlb_name: ceph9-nfs-nlb
-nfs_nlb_tg_name: ceph9-nfs-tg
-# RGW hosts already carry the 'rgw' label from the base build.
-rgw_ha_hosts: [ceph02, ceph03]
-rgw_lb_port: 8080
-rgw_nlb_name: ceph9-rgw-nlb
-rgw_nlb_tg_name: ceph9-rgw-tg
-# One internal NLB per service (looped by the playbook).
-ceph_nlbs:
-  - { name: "{{ nfs_nlb_name }}", tg: "{{ nfs_nlb_tg_name }}", port: "{{ nfs_port }}",   hosts: "{{ nfs_ha_hosts }}" }
-  - { name: "{{ rgw_nlb_name }}", tg: "{{ rgw_nlb_tg_name }}", port: "{{ rgw_lb_port }}", hosts: "{{ rgw_ha_hosts }}" }
+# --- Storage tiers (phase 06) + HA NLB endpoints (phase 07) -------------
+# Both are topology-specific and now live in the 4node-twotier profile
+# (inventory/topologies/4node-twotier.yml). The 12node-tiered profile models its
+# three tiers differently — per-node device class set at OSD-creation time, with
+# AWS NLBs configured outside this repo (no phase-07 NLB vars).

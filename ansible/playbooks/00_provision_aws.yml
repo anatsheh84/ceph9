@@ -2,6 +2,8 @@
 - name: Provision AWS infrastructure for Ceph 9
   hosts: localhost
   gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventory/topologies/{{ ceph_topology }}.yml"
   connection: local
   roles:
     - aws_infra
