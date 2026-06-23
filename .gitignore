@@ -23,3 +23,6 @@ ansible/.provisioned.json
 __pycache__/
 **/__pycache__/
 *.pyc
+
+# ── run logs (runtime artifacts, never commit) ────────────────────────────
+*.log
