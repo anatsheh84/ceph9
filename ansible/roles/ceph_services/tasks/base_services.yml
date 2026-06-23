@@ -1,0 +1,70 @@
+---
+# 4node two-tier services: single RBD pool, single CephFS volume, one RGW, one
+# NFS cluster + export. (Moved verbatim from the original main.yml; unchanged.)
+
+- name: RBD pool (create if missing)
+  ansible.builtin.shell: |
+    set -e
+    if cephadm shell -- ceph osd pool ls 2>/dev/null | grep -qx '{{ rbd_pool_name }}'; then
+      echo EXISTS
+    else
+      cephadm shell -- ceph osd pool create {{ rbd_pool_name }} {{ rbd_pool_pg_num }} {{ rbd_pool_pg_num }} replicated
+      cephadm shell -- ceph osd pool application enable {{ rbd_pool_name }} rbd
+      cephadm shell -- rbd pool init {{ rbd_pool_name }}
+      echo CREATED
+    fi
+  register: rbd_pool
+  changed_when: "'CREATED' in rbd_pool.stdout"
+
+- name: CephFS volume (create if missing)
+  ansible.builtin.shell: |
+    set -e
+    if cephadm shell -- ceph fs volume ls 2>/dev/null | grep -q '"name": "{{ cephfs_volume }}"'; then
+      echo EXISTS
+    else
+      cephadm shell -- ceph fs volume create {{ cephfs_volume }} --placement=label:mds
+      echo CREATED
+    fi
+  register: cephfs
+  changed_when: "'CREATED' in cephfs.stdout"
+
+- name: RGW service (apply spec is idempotent)
+  ansible.builtin.shell: |
+    /usr/sbin/cephadm shell -- ceph orch apply rgw {{ rgw_service_name }} \
+      --placement="label:rgw count-per-host:1" --port={{ rgw_port }}
+  changed_when: false
+
+- name: NFS cluster (create if missing)
+  ansible.builtin.shell: |
+    set -e
+    if cephadm shell -- ceph nfs cluster ls 2>/dev/null | grep -qx '{{ nfs_cluster_name }}'; then
+      echo EXISTS
+    else
+      cephadm shell -- ceph nfs cluster create {{ nfs_cluster_name }} label:nfs
+      echo CREATED
+    fi
+  register: nfs_cluster
+  changed_when: "'CREATED' in nfs_cluster.stdout"
+
+- name: Wait for NFS cluster to be running
+  ansible.builtin.shell: |
+    cephadm shell -- ceph orch ls --service_type=nfs --format=json 2>/dev/null \
+      | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[0]["status"]["running"] if d else 0)'
+  register: nfs_running
+  until: nfs_running.stdout | int >= 1
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: NFS export for CephFS (create if missing)
+  ansible.builtin.shell: |
+    set -e
+    EXPORTS=$(cephadm shell -- ceph nfs export ls {{ nfs_cluster_name }} 2>/dev/null)
+    if echo "$EXPORTS" | grep -q '/cephfs'; then
+      echo EXISTS
+    else
+      cephadm shell -- ceph nfs export create cephfs {{ nfs_cluster_name }} /cephfs {{ cephfs_volume }} --path=/
+      echo CREATED
+    fi
+  register: nfs_export
+  changed_when: "'CREATED' in nfs_export.stdout"

@@ -1,0 +1,20 @@
+---
+# 12node three-tier services (nvme/sas/sata). OSDs + their CRUSH device classes
+# already exist (created by ceph_cluster). Build the per-tier pools, three
+# CephFS filesystems, RGW storage classes and the NFS exports on top.
+
+- name: CRUSH rules + per-tier RBD pools
+  ansible.builtin.include_tasks: tiered_crush_pools.yml
+
+- name: Three CephFS filesystems (metadata pinned to nvme, standby-replay)
+  ansible.builtin.include_tasks: tiered_cephfs.yml
+
+- name: RGW — single zone, three storage classes, count_per_host 2
+  ansible.builtin.include_tasks: tiered_rgw.yml
+
+- name: NFS — one cluster, three CephFS exports
+  ansible.builtin.include_tasks: tiered_nfs.yml
+
+- name: Pin Grafana to its labelled host (grafana on nvme02)
+  ansible.builtin.shell: cephadm shell -- ceph orch apply grafana --placement=label:grafana
+  changed_when: false

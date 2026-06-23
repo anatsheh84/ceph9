@@ -1,0 +1,35 @@
+---
+# One replicated CRUSH rule per device class, and one replicated RBD pool per
+# tier pinned to that rule. The device classes already exist (set on the OSDs
+# at creation by ceph_cluster), so the rules can reference them safely.
+
+- name: Create per-tier CRUSH rules (rule-<class>)
+  ansible.builtin.shell: |
+    set -e
+    R="{{ ceph_tiers[item].crush_rule }}"; C="{{ ceph_tiers[item].device_class }}"
+    if cephadm shell -- ceph osd crush rule ls 2>/dev/null | grep -qx "$R"; then
+      echo EXISTS
+    else
+      cephadm shell -- ceph osd crush rule create-replicated "$R" default host "$C"
+      echo CREATED
+    fi
+  loop: "{{ ceph_tier_order }}"
+  register: crush_rules
+  changed_when: "'CREATED' in crush_rules.stdout"
+
+- name: Create per-tier replicated RBD pools (rbd-<tier>, replica 3)
+  ansible.builtin.shell: |
+    set -e
+    P="{{ ceph_tiers[item].rbd_pool }}"; R="{{ ceph_tiers[item].crush_rule }}"
+    if cephadm shell -- ceph osd pool ls 2>/dev/null | grep -qx "$P"; then
+      echo EXISTS
+    else
+      cephadm shell -- ceph osd pool create "$P" {{ tier_pg_num }} {{ tier_pg_num }} replicated "$R"
+      cephadm shell -- ceph osd pool set "$P" size 3
+      cephadm shell -- ceph osd pool application enable "$P" rbd
+      cephadm shell -- rbd pool init "$P"
+      echo CREATED
+    fi
+  loop: "{{ ceph_tier_order }}"
+  register: rbd_pools
+  changed_when: "'CREATED' in rbd_pools.stdout"

@@ -12,6 +12,14 @@
 - ansible.builtin.import_playbook: 02_bootstrap.yml
 - ansible.builtin.import_playbook: 03_cluster.yml
 - ansible.builtin.import_playbook: 04_services.yml
+# Phases 05-07 are the 4node two-tier path. The 12node-tiered topology builds
+# all three device-class tiers (CRUSH rules, pools, 3x CephFS, RGW storage
+# classes, NFS exports) inside phase 04, and fronts RGW/NFS with AWS NLBs
+# configured outside this repo — so smoke + the phase-06/07 NLB logic are
+# skipped for it (validate.yml covers 12node verification instead).
 - ansible.builtin.import_playbook: 05_smoke.yml
+  when: ceph_topology != '12node-tiered'
 - ansible.builtin.import_playbook: 06_storage_tiers.yml
+  when: ceph_topology != '12node-tiered'
 - ansible.builtin.import_playbook: 07_nfs_ha_lb.yml
+  when: ceph_topology != '12node-tiered'
