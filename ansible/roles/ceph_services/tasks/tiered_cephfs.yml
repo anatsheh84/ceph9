@@ -1,0 +1,68 @@
+---
+# One CephFS filesystem per tier. Each filesystem's DATA pool lives on its own
+# tier rule; ALL THREE METADATA pools are pinned to rule-nvme (fast metadata).
+# Each filesystem gets 1 active + 1 standby-replay MDS (node01 + node03 of the
+# tier, both carry the 'mds' label).
+
+- name: Create per-tier CephFS metadata pools (pinned to nvme)
+  ansible.builtin.shell: |
+    set -e
+    P="{{ ceph_tiers[item].fs_name }}-meta"
+    if cephadm shell -- ceph osd pool ls 2>/dev/null | grep -qx "$P"; then echo EXISTS; else
+      cephadm shell -- ceph osd pool create "$P" {{ tier_pg_num }} {{ tier_pg_num }} replicated {{ tiered_meta_crush_rule }}
+      cephadm shell -- ceph osd pool set "$P" size 3
+      cephadm shell -- ceph osd pool application enable "$P" cephfs
+      echo CREATED
+    fi
+  loop: "{{ ceph_tier_order }}"
+  register: fs_meta
+  changed_when: "'CREATED' in fs_meta.stdout"
+
+- name: Create per-tier CephFS data pools (pinned to the tier rule)
+  ansible.builtin.shell: |
+    set -e
+    P="{{ ceph_tiers[item].fs_name }}-data"; R="{{ ceph_tiers[item].crush_rule }}"
+    if cephadm shell -- ceph osd pool ls 2>/dev/null | grep -qx "$P"; then echo EXISTS; else
+      cephadm shell -- ceph osd pool create "$P" {{ tier_pg_num }} {{ tier_pg_num }} replicated "$R"
+      cephadm shell -- ceph osd pool set "$P" size 3
+      cephadm shell -- ceph osd pool application enable "$P" cephfs
+      echo CREATED
+    fi
+  loop: "{{ ceph_tier_order }}"
+  register: fs_data
+  changed_when: "'CREATED' in fs_data.stdout"
+
+- name: Create the CephFS filesystems (ceph fs new)
+  ansible.builtin.shell: |
+    set -e
+    FS="{{ ceph_tiers[item].fs_name }}"
+    if cephadm shell -- ceph fs ls 2>/dev/null | grep -q "name: ${FS},"; then echo EXISTS; else
+      cephadm shell -- ceph fs new "$FS" "${FS}-meta" "${FS}-data"
+      echo CREATED
+    fi
+  loop: "{{ ceph_tier_order }}"
+  register: fs_new
+  changed_when: "'CREATED' in fs_new.stdout"
+
+- name: Enable standby-replay on each filesystem
+  ansible.builtin.command:
+    cmd: cephadm shell -- ceph fs set {{ ceph_tiers[item].fs_name }} allow_standby_replay true
+  loop: "{{ ceph_tier_order }}"
+  changed_when: false
+
+- name: Deploy MDS per filesystem (1 active + 1 standby-replay on node01+node03)
+  ansible.builtin.shell: |
+    cephadm shell -- ceph orch apply mds {{ ceph_tiers[item].fs_name }} \
+      --placement="{{ ceph_nodes | selectattr('tier','==',item) | selectattr('labels','contains','mds') | map(attribute='name') | join(' ') }}"
+  loop: "{{ ceph_tier_order }}"
+  changed_when: false
+
+- name: Wait for 6 MDS daemons (3 active + 3 standby-replay)
+  ansible.builtin.shell: |
+    cephadm shell -- ceph orch ls --service_type=mds --format=json 2>/dev/null \
+      | python3 -c 'import sys,json; print(sum(s["status"]["running"] for s in json.load(sys.stdin)))'
+  register: mds_running
+  until: mds_running.stdout | int >= (ceph_tier_order | length) * 2
+  retries: 30
+  delay: 10
+  changed_when: false
