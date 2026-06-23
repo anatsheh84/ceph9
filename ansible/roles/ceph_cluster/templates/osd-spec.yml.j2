@@ -1,7 +1,15 @@
 # cephadm OSD drivegroup spec for the '{{ item }}' tier (rendered per tier).
-# One OSD per host on the single explicit data device, with the CRUSH device
-# class set at creation. Targets only this tier's hosts and only this device,
-# so no spare/unmounted volume is ever auto-consumed.
+# One OSD per host with the CRUSH device class set at creation, on this tier's
+# hosts only.
+#
+# The single data disk is matched BY SIZE, not by device name: on AWS Nitro the
+# in-guest NVMe enumeration (nvme0n1 vs nvme1n1) is not deterministic, so a fixed
+# path like /dev/nvme1n1 can land on the root volume on some hosts. The data
+# disk's size ({{ ceph_tiers[item].osd_volume_size }}G) uniquely distinguishes it
+# from the {{ ceph_root_gb }}G root volume — and since there is exactly one data
+# disk per host, the size filter still selects exactly one device (it never scans
+# for or consumes a spare). `osd_data_device` ({{ osd_data_device }}) remains the
+# documented expected name and the 12node topology discriminator.
 service_type: osd
 service_id: osd-{{ item }}
 placement:
@@ -11,6 +19,5 @@ placement:
 {% endfor %}
 spec:
   data_devices:
-    paths:
-      - {{ osd_data_device }}
+    size: '{{ (ceph_tiers[item].osd_volume_size * 0.8) | int }}G:'
   crush_device_class: {{ ceph_tiers[item].device_class }}
