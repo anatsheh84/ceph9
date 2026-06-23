@@ -1,0 +1,41 @@
+---
+# One NFS-Ganesha cluster on the 'nfs' labelled hosts (6 hosts -> 6 daemons),
+# re-exporting each of the three CephFS filesystems as its own export. No
+# cephadm ingress; AWS NLB fronts :2049 across the hosts externally.
+
+- name: NFS cluster (create if missing)
+  ansible.builtin.shell: |
+    set -e
+    if cephadm shell -- ceph nfs cluster ls 2>/dev/null | grep -qx '{{ nfs_cluster_name }}'; then
+      echo EXISTS
+    else
+      cephadm shell -- ceph nfs cluster create {{ nfs_cluster_name }} label:nfs
+      echo CREATED
+    fi
+  register: nfs_cluster
+  changed_when: "'CREATED' in nfs_cluster.stdout"
+
+- name: Wait for all NFS-Ganesha daemons to be running (one per nfs host)
+  ansible.builtin.shell: |
+    cephadm shell -- ceph orch ls --service_type=nfs --format=json 2>/dev/null \
+      | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[0]["status"]["running"] if d else 0)'
+  register: nfs_running
+  until: nfs_running.stdout | int >= (ceph_nodes | selectattr('labels','contains','nfs') | list | length)
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Create one NFS export per CephFS filesystem
+  ansible.builtin.shell: |
+    set -e
+    PSEUDO="{{ item.pseudo }}"; FS="{{ item.fs_name }}"
+    if cephadm shell -- ceph nfs export ls {{ nfs_cluster_name }} 2>/dev/null | grep -q "\"$PSEUDO\""; then
+      echo EXISTS
+    else
+      cephadm shell -- ceph nfs export create cephfs {{ nfs_cluster_name }} "$PSEUDO" "$FS" --path=/
+      echo CREATED
+    fi
+  loop: "{{ nfs_exports }}"
+  loop_control: { label: "{{ item.pseudo }}" }
+  register: nfs_export
+  changed_when: "'CREATED' in nfs_export.stdout"
