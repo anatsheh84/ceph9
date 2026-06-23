@@ -1,0 +1,65 @@
+---
+# Single RGW zone (the cephadm-created default zone = one realm/one zone) with
+# three storage classes STANDARD_NVME/SAS/SATA, each backed by a replicated data
+# pool on its tier rule. RGW system pools (root/control/meta/log/index) and the
+# default data pool are pinned to rule-nvme. Daemons run count_per_host=2 on the
+# 'rgw' labelled hosts (6 hosts -> 12 daemons). No cephadm ingress; AWS NLB
+# fronts the per-host ports externally.
+
+- name: Apply RGW service (count_per_host 2, on rgw-labelled hosts)
+  ansible.builtin.shell: |
+    /usr/sbin/cephadm shell -- ceph orch apply rgw {{ rgw_service_name }} \
+      --placement="label:rgw count-per-host:{{ rgw_count_per_host }}" --port={{ rgw_port }}
+  changed_when: false
+
+- name: Wait for RGW system pools to appear
+  ansible.builtin.shell: |
+    cephadm shell -- ceph osd pool ls 2>/dev/null | grep -qx '.rgw.root' && echo READY || echo WAIT
+  register: rgw_pools_ready
+  until: "'READY' in rgw_pools_ready.stdout"
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Pin RGW system + default data pools to rule-nvme (never the tier pools)
+  ansible.builtin.shell: |
+    for p in $(cephadm shell -- ceph osd pool ls 2>/dev/null | grep '\.rgw\.' | grep -vE '\.(nvme|sas|sata)$'); do
+      cephadm shell -- ceph osd pool set "$p" crush_rule {{ tiered_meta_crush_rule }} >/dev/null
+    done
+    echo OK
+  changed_when: false
+
+- name: Create per-tier RGW data pools (pinned to the tier rule)
+  ansible.builtin.shell: |
+    set -e
+    P="{{ ceph_tiers[item].rgw_data_pool }}"; R="{{ ceph_tiers[item].crush_rule }}"
+    if cephadm shell -- ceph osd pool ls 2>/dev/null | grep -qx "$P"; then echo EXISTS; else
+      cephadm shell -- ceph osd pool create "$P" {{ tier_pg_num }} {{ tier_pg_num }} replicated "$R"
+      cephadm shell -- ceph osd pool set "$P" size 3
+      cephadm shell -- ceph osd pool application enable "$P" rgw
+      echo CREATED
+    fi
+  loop: "{{ ceph_tier_order }}"
+  register: rgw_data
+  changed_when: "'CREATED' in rgw_data.stdout"
+
+- name: Add per-tier storage classes to default-placement
+  ansible.builtin.shell: |
+    set -e
+    SC="{{ ceph_tiers[item].rgw_storage_class }}"; DP="{{ ceph_tiers[item].rgw_data_pool }}"
+    if cephadm shell -- radosgw-admin zone placement list 2>/dev/null | grep -q "\"$SC\""; then echo EXISTS; else
+      cephadm shell -- radosgw-admin zonegroup placement add --rgw-zonegroup default --placement-id default-placement --storage-class "$SC"
+      cephadm shell -- radosgw-admin zone placement add --rgw-zone default --placement-id default-placement --storage-class "$SC" --data-pool "$DP"
+      echo CREATED
+    fi
+  loop: "{{ ceph_tier_order }}"
+  register: rgw_sc
+  changed_when: "'CREATED' in rgw_sc.stdout"
+
+- name: Commit RGW period + restart RGW when storage classes changed
+  ansible.builtin.shell: |
+    cephadm shell -- radosgw-admin period update --commit 2>/dev/null || true
+    cephadm shell -- ceph orch restart rgw.{{ rgw_service_name }}
+  when: rgw_sc.changed
+  changed_when: true
+  failed_when: false
