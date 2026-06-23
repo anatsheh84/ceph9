@@ -1,0 +1,160 @@
+---
+# Validate a deployed 12node-tiered cluster. Human-readable, fails loudly on any
+# mismatch. Run after the build:
+#   ansible-playbook -e ceph_topology=12node-tiered \
+#     playbooks/00_provision_aws.yml playbooks/validate.yml
+# (00 first only to repopulate the in-memory inventory; it is idempotent.)
+- name: Validate 12node-tiered Ceph cluster
+  hosts: admin
+  become: true
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventory/topologies/{{ ceph_topology }}.yml"
+  tasks:
+    - name: This validator targets 12node-tiered only
+      ansible.builtin.meta: end_play
+      when: ceph_topology != '12node-tiered'
+
+    - name: ceph health
+      ansible.builtin.command: cephadm shell -- ceph health
+      register: r_health
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "'HEALTH_OK' in r_health.stdout"
+        success_msg: "OK  health: HEALTH_OK"
+        fail_msg: "FAIL health: {{ r_health.stdout }}"
+
+    - name: mon quorum count
+      ansible.builtin.shell: cephadm shell -- ceph quorum_status -f json 2>/dev/null | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["quorum"]))'
+      register: r_mon
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "r_mon.stdout | int == 3"
+        success_msg: "OK  MONs in quorum: 3"
+        fail_msg: "FAIL MONs in quorum: {{ r_mon.stdout }} (want 3)"
+
+    - name: mgr count (1 active + standbys)
+      ansible.builtin.shell: cephadm shell -- ceph mgr stat -f json 2>/dev/null | python3 -c 'import sys,json;d=json.load(sys.stdin);print((1 if d.get("active_name") else 0)+len(d.get("standbys",[])))'
+      register: r_mgr
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "r_mgr.stdout | int == 3"
+        success_msg: "OK  MGRs: 3 (1 active + 2 standby)"
+        fail_msg: "FAIL MGRs: {{ r_mgr.stdout }} (want 3)"
+
+    - name: osd up/in total
+      ansible.builtin.shell: cephadm shell -- ceph osd ls 2>/dev/null | wc -l
+      register: r_osd
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "r_osd.stdout | int == ceph_nodes | length"
+        success_msg: "OK  OSDs: {{ r_osd.stdout | trim }} (one per node)"
+        fail_msg: "FAIL OSDs: {{ r_osd.stdout }} (want {{ ceph_nodes | length }})"
+
+    - name: osd count per device class
+      ansible.builtin.shell: cephadm shell -- ceph osd crush class ls-osd {{ item }} 2>/dev/null | grep -c .
+      loop: "{{ ceph_tier_order }}"
+      register: r_class
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "item.stdout | int == 4"
+        success_msg: "OK  class {{ item.item }}: 4 OSDs"
+        fail_msg: "FAIL class {{ item.item }}: {{ item.stdout }} OSDs (want 4)"
+      loop: "{{ r_class.results }}"
+      loop_control: { label: "{{ item.item }}" }
+
+    - name: cephfs filesystem count
+      ansible.builtin.shell: cephadm shell -- ceph fs ls 2>/dev/null | grep -c '^name:'
+      register: r_fs
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "r_fs.stdout | int == ceph_tier_order | length"
+        success_msg: "OK  CephFS filesystems: {{ r_fs.stdout | trim }}"
+        fail_msg: "FAIL CephFS filesystems: {{ r_fs.stdout }} (want {{ ceph_tier_order | length }})"
+
+    - name: each fs has a standby-replay MDS
+      ansible.builtin.shell: cephadm shell -- ceph fs status {{ ceph_tiers[item].fs_name }} 2>/dev/null | grep -c 'standby-replay'
+      loop: "{{ ceph_tier_order }}"
+      register: r_sbr
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "item.stdout | int >= 1"
+        success_msg: "OK  {{ ceph_tiers[item.item].fs_name }}: standby-replay present"
+        fail_msg: "FAIL {{ ceph_tiers[item.item].fs_name }}: no standby-replay MDS"
+      loop: "{{ r_sbr.results }}"
+      loop_control: { label: "{{ ceph_tiers[item.item].fs_name }}" }
+
+    - name: rgw daemon count + host spread
+      ansible.builtin.shell: cephadm shell -- ceph orch ps --daemon_type rgw -f json 2>/dev/null | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len(d), len({x["hostname"] for x in d}))'
+      register: r_rgw
+      changed_when: false
+    - ansible.builtin.assert:
+        that:
+          - "r_rgw.stdout.split()[0] | int == 12"
+          - "r_rgw.stdout.split()[1] | int == 6"
+        success_msg: "OK  RGW daemons: 12 across 6 hosts"
+        fail_msg: "FAIL RGW: {{ r_rgw.stdout }} (want '12 6')"
+
+    - name: nfs daemon count
+      ansible.builtin.shell: cephadm shell -- ceph orch ps --daemon_type nfs -f json 2>/dev/null | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))'
+      register: r_nfs
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "r_nfs.stdout | int == 6"
+        success_msg: "OK  NFS-Ganesha daemons: 6"
+        fail_msg: "FAIL NFS daemons: {{ r_nfs.stdout }} (want 6)"
+
+    - name: _admin label on 3 hosts
+      ansible.builtin.shell: cephadm shell -- ceph orch host ls --label _admin 2>/dev/null | grep -cE '^(nvme|sas|sata)'
+      register: r_admin
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "r_admin.stdout | int == 3"
+        success_msg: "OK  _admin label on 3 MON hosts"
+        fail_msg: "FAIL _admin hosts: {{ r_admin.stdout }} (want 3)"
+
+    - name: per-tier RBD pool -> correct CRUSH rule
+      ansible.builtin.shell: cephadm shell -- ceph osd pool get {{ ceph_tiers[item].rbd_pool }} crush_rule 2>/dev/null | awk '{print $2}'
+      loop: "{{ ceph_tier_order }}"
+      register: r_rbdrule
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "item.stdout | trim == ceph_tiers[item.item].crush_rule"
+        success_msg: "OK  {{ ceph_tiers[item.item].rbd_pool }} -> {{ item.stdout | trim }}"
+        fail_msg: "FAIL {{ ceph_tiers[item.item].rbd_pool }} -> {{ item.stdout | trim }} (want {{ ceph_tiers[item.item].crush_rule }})"
+      loop: "{{ r_rbdrule.results }}"
+      loop_control: { label: "{{ ceph_tiers[item.item].rbd_pool }}" }
+
+    - name: all CephFS metadata pools resolve to nvme
+      ansible.builtin.shell: cephadm shell -- ceph osd pool get {{ ceph_tiers[item].fs_name }}-meta crush_rule 2>/dev/null | awk '{print $2}'
+      loop: "{{ ceph_tier_order }}"
+      register: r_metarule
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "item.stdout | trim == tiered_meta_crush_rule"
+        success_msg: "OK  {{ ceph_tiers[item.item].fs_name }}-meta -> {{ item.stdout | trim }}"
+        fail_msg: "FAIL {{ ceph_tiers[item.item].fs_name }}-meta -> {{ item.stdout | trim }} (want {{ tiered_meta_crush_rule }})"
+      loop: "{{ r_metarule.results }}"
+      loop_control: { label: "{{ ceph_tiers[item.item].fs_name }}-meta" }
+
+    - name: non-data RGW pools resolve to nvme
+      ansible.builtin.shell: |
+        for p in $(cephadm shell -- ceph osd pool ls 2>/dev/null | grep '\.rgw\.' | grep -vE '\.(nvme|sas|sata)$'); do
+          r=$(cephadm shell -- ceph osd pool get "$p" crush_rule 2>/dev/null | awk '{print $2}')
+          [ "$r" = "{{ tiered_meta_crush_rule }}" ] || echo "BAD $p=$r"
+        done
+        echo DONE
+      register: r_rgwsys
+      changed_when: false
+    - ansible.builtin.assert:
+        that: "'BAD' not in r_rgwsys.stdout"
+        success_msg: "OK  all non-data RGW pools on {{ tiered_meta_crush_rule }}"
+        fail_msg: "FAIL non-nvme RGW system pools: {{ r_rgwsys.stdout }}"
+
+    - name: VALIDATION SUMMARY
+      ansible.builtin.debug:
+        msg:
+          - "health=HEALTH_OK  mon=3  mgr=3  osd={{ r_osd.stdout | trim }} (4/class)"
+          - "cephfs={{ r_fs.stdout | trim }} (each +standby-replay)  rgw=12/6hosts  nfs=6"
+          - "_admin=3 hosts  pools->rules OK  meta+rgw-system on {{ tiered_meta_crush_rule }}"
+          - "12node-tiered cluster VALIDATED."
