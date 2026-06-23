@@ -63,3 +63,24 @@
   when: rgw_sc.changed
   changed_when: true
   failed_when: false
+
+# RGW creates default.rgw.control/meta/log lazily, often AFTER the early pin
+# above ran (which only waited for .rgw.root). Re-pin all system pools now that
+# the zone is fully initialised, so none are left on the default rule. Retried
+# in case a pool is still appearing.
+- name: Re-pin all RGW system pools to nvme (catch lazily-created control/meta/log)
+  ansible.builtin.shell: |
+    cephadm shell -- ceph osd pool ls 2>/dev/null | grep '\.rgw\.' | grep -vE '\.(nvme|sas|sata)$' \
+      | while read -r p; do cephadm shell -- ceph osd pool set "$p" crush_rule {{ tiered_meta_crush_rule }} >/dev/null; done
+    # report any still not on the meta rule
+    BAD=0
+    for p in $(cephadm shell -- ceph osd pool ls 2>/dev/null | grep '\.rgw\.' | grep -vE '\.(nvme|sas|sata)$'); do
+      r=$(cephadm shell -- ceph osd pool get "$p" crush_rule 2>/dev/null | awk '{print $2}')
+      [ "$r" = "{{ tiered_meta_crush_rule }}" ] || BAD=1
+    done
+    echo "BAD=$BAD"
+  register: rgw_repin
+  until: "'BAD=0' in rgw_repin.stdout"
+  retries: 6
+  delay: 10
+  changed_when: false

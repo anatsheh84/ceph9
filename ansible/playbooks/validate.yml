@@ -34,7 +34,7 @@
         fail_msg: "FAIL MONs in quorum: {{ r_mon.stdout }} (want 3)"
 
     - name: mgr count (1 active + standbys)
-      ansible.builtin.shell: cephadm shell -- ceph mgr stat -f json 2>/dev/null | python3 -c 'import sys,json;d=json.load(sys.stdin);print((1 if d.get("active_name") else 0)+len(d.get("standbys",[])))'
+      ansible.builtin.shell: cephadm shell -- ceph mgr dump -f json 2>/dev/null | python3 -c 'import sys,json;d=json.load(sys.stdin);print((1 if d.get("active_name") else 0)+len(d.get("standbys",[])))'
       register: r_mgr
       changed_when: false
     - ansible.builtin.assert:
