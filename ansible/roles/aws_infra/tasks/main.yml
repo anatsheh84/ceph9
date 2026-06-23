@@ -328,9 +328,10 @@
     bastion_id: "{{ bastion_create.stdout if (bastion_lookup.stdout in ['','None']) else bastion_lookup.stdout }}"
 
 # ----- Ceph nodes -----------------------------------------------------------
-- name: Build OSD device hint list
+- name: Build OSD device hint list (4node multi-disk path)
   ansible.builtin.set_fact:
     osd_devices: "{{ ['/dev/sdb','/dev/sdc','/dev/sdd','/dev/sde'][:osd_disks_per_node] }}"
+  when: osd_disks_per_node is defined
 
 - name: Look up existing ceph nodes
   ansible.builtin.shell: >
@@ -360,8 +361,33 @@
       --query 'Instances[0].InstanceId' --output text
   loop: "{{ ceph_nodes_lookup.results }}"
   loop_control: { label: "{{ item.item.name }}" }
-  when: item.stdout in ['', 'None']
+  when:
+    - item.stdout in ['', 'None']
+    - osd_disks_per_node is defined            # 4node multi-disk path only
   register: ceph_create
+
+# 12node-tiered: exactly ONE OSD data disk per host, EBS type chosen per tier
+# (gp3=nvme, st1=sas, sc1=sata). No extra/unmounted volumes are attached.
+- name: Launch missing ceph nodes (single explicit OSD disk per host, tiered)
+  ansible.builtin.shell: |
+    BDM='DeviceName=/dev/sda1,Ebs={VolumeSize={{ ceph_root_gb }},VolumeType=gp3,DeleteOnTermination=true}'
+    BDM="$BDM DeviceName={{ osd_aws_device_name }},Ebs={VolumeSize={{ ceph_tiers[item.item.tier].osd_volume_size }},VolumeType={{ ceph_tiers[item.item.tier].osd_volume_type }},DeleteOnTermination=true}"
+    aws ec2 run-instances --region {{ aws_region }} \
+      --image-id {{ effective_ami }} --instance-type {{ ceph_tiers[item.item.tier].instance_type }} \
+      --key-name {{ keypair_name }} --subnet-id {{ private_subnet_id }} \
+      --security-group-ids {{ sg_id }} \
+      --private-ip-address {{ item.item.ip }} \
+      --no-associate-public-ip-address \
+      --placement GroupName={{ project_tag }}-cluster \
+      --block-device-mappings $BDM \
+      --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value={{ item.item.name }}},{Key=Project,Value={{ project_tag }}},{Key=Role,Value=ceph},{Key=Tier,Value={{ item.item.tier }}},{Key=Labels,Value={{ item.item.labels | join('|') }}}]" \
+      --query 'Instances[0].InstanceId' --output text
+  loop: "{{ ceph_nodes_lookup.results }}"
+  loop_control: { label: "{{ item.item.name }}" }
+  when:
+    - item.stdout in ['', 'None']
+    - osd_data_device is defined               # 12node single-disk tiered path
+  register: ceph_create_tiered
 
 - name: Wait for all instances to be running
   ansible.builtin.shell: |
@@ -437,7 +463,10 @@
     ansible_host: "{{ item.ip }}"
     groups:
       - ceph
-      - "{{ 'admin' if '_admin' in item.labels else 'cephworkers' }}"
+      # Ansible 'admin' group = the single bootstrap/orchestrator host. The Ceph
+      # '_admin' LABEL (admin keyring) is applied separately by ceph_cluster to
+      # every node that lists it (3 MON hosts on 12node-tiered).
+      - "{{ 'admin' if item.name == ceph_bootstrap_node else 'cephworkers' }}"
     ansible_user: ec2-user
     ansible_ssh_private_key_file: "{{ key_local_path }}"
     ansible_ssh_common_args: '-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/ceph9-known_hosts -o "ProxyCommand=ssh -W %h:%p -i {{ key_local_path }} -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/ceph9-known_hosts ec2-user@{{ bastion_public_ip }}"'

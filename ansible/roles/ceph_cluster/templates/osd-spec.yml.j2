@@ -1,0 +1,16 @@
+# cephadm OSD drivegroup spec for the '{{ item }}' tier (rendered per tier).
+# One OSD per host on the single explicit data device, with the CRUSH device
+# class set at creation. Targets only this tier's hosts and only this device,
+# so no spare/unmounted volume is ever auto-consumed.
+service_type: osd
+service_id: osd-{{ item }}
+placement:
+  hosts:
+{% for n in ceph_nodes if n.tier == item %}
+    - {{ n.name }}
+{% endfor %}
+spec:
+  data_devices:
+    paths:
+      - {{ osd_data_device }}
+  crush_device_class: {{ ceph_tiers[item].device_class }}

@@ -18,7 +18,7 @@
     - name: Add ceph02-04 to the cluster
       ansible.builtin.command:
         cmd: /usr/sbin/cephadm shell -- ceph orch host add {{ item.name }} {{ item.ip }}
-      loop: "{{ ceph_nodes | rejectattr('name','==','ceph01') | list }}"
+      loop: "{{ ceph_nodes | rejectattr('name','==', ceph_bootstrap_node) | list }}"
       register: host_add
       changed_when: "'Added' in host_add.stdout"
       failed_when:
@@ -47,12 +47,16 @@
         cmd: /usr/sbin/cephadm shell -- ceph orch apply mgr --placement=label:mgr
       changed_when: false
 
-    - name: Deploy OSDs on every available device
+    # --- OSD provisioning -------------------------------------------------
+    # 4node: consume all attached gp3 data disks (default device class 'ssd';
+    # phase 06 later reclassifies the st1 disk to 'hdd').
+    - name: Deploy OSDs on every available device (4node)
       ansible.builtin.command:
         cmd: /usr/sbin/cephadm shell -- ceph orch apply osd --all-available-devices
+      when: osd_disks_per_node is defined
       changed_when: false
 
-    - name: Wait for all OSDs to come up
+    - name: Wait for all OSDs to come up (4node)
       ansible.builtin.shell: |
         set -o pipefail
         cephadm shell -- ceph -s 2>/dev/null \
@@ -62,4 +66,36 @@
       until: (osd_up.stdout | int) == (ceph_nodes | length) * osd_disks_per_node
       retries: 40
       delay: 15
+      when: osd_disks_per_node is defined
       changed_when: false
+
+    # 12node-tiered: ONE explicit OSD per host with its CRUSH device class set at
+    # creation. A per-tier drivegroup spec targets that tier's hosts and its one
+    # data device — never --all-available-devices, never scans spare volumes.
+    - name: Deploy single-disk OSDs per tier (12node-tiered)
+      when: osd_data_device is defined
+      block:
+        - name: Render per-tier OSD drivegroup specs
+          ansible.builtin.template:
+            src: osd-spec.yml.j2
+            dest: "/tmp/osd-{{ item }}.yml"
+            mode: '0644'
+          loop: "{{ ceph_tier_order }}"
+
+        - name: Apply per-tier OSD drivegroup specs (class set at creation)
+          ansible.builtin.command:
+            cmd: /usr/sbin/cephadm shell --mount /tmp/osd-{{ item }}.yml -- ceph orch apply -i /mnt/osd-{{ item }}.yml
+          loop: "{{ ceph_tier_order }}"
+          changed_when: true
+
+        - name: Wait for all OSDs to come up (one per host)
+          ansible.builtin.shell: |
+            set -o pipefail
+            cephadm shell -- ceph -s 2>/dev/null \
+              | grep -oE '[0-9]+ osds: [0-9]+ up' \
+              | awk '{print $3}'
+          register: osd_up_tiered
+          until: (osd_up_tiered.stdout | int) == (ceph_nodes | length)
+          retries: 60
+          delay: 15
+          changed_when: false

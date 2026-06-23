@@ -28,7 +28,7 @@
     cmd: >-
       /usr/sbin/cephadm bootstrap
       --ssh-user ec2-user
-      --mon-ip {{ ceph_nodes | selectattr('name','==','ceph01') | map(attribute='ip') | first }}
+      --mon-ip {{ ceph_nodes | selectattr('name','==', ceph_bootstrap_node) | map(attribute='ip') | first }}
       --cluster-network {{ private_subnet_cidr }}
       --allow-fqdn-hostname
       --registry-json /etc/mylogin.json
