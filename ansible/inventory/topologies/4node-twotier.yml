@@ -1,0 +1,55 @@
+---
+# ============================================================================
+# Topology profile: 4node-twotier   (the original cluster — behavior unchanged)
+#
+# Selected by `ceph_topology: 4node-twotier` (the default). Every play loads the
+# matching profile via vars_files. These are the topology-specific knobs; shared
+# vars (region, network, creds, ports, base sizing) stay in group_vars/all.yml.
+#
+# Tier model (unchanged): build all-gp3 OSDs (device class 'ssd'), then phase 06
+# attaches one st1 disk per node and reclassifies it to device class 'hdd'.
+# ============================================================================
+
+# Host that runs `cephadm bootstrap` and all orchestrator (`ceph orch`) commands.
+# The Ansible 'admin' group is built from this single name; the `_admin` Ceph
+# LABEL (admin keyring) is applied separately to every node whose labels list it.
+ceph_bootstrap_node: ceph01
+
+# --- OSD layout (multiple gp3 data disks per node, consumed by cephadm) ------
+osd_disks_per_node: 2
+osd_disk_gb: 500
+
+# --- Nodes (fixed private IPs; labels drive daemon placement + inventory) ----
+ceph_nodes:
+  - { name: ceph01, ip: 10.20.2.11, labels: [_admin, mon, mgr, osd, mds] }
+  - { name: ceph02, ip: 10.20.2.12, labels: [mon, mgr, osd, rgw] }
+  - { name: ceph03, ip: 10.20.2.13, labels: [mon, osd, rgw, nfs] }
+  - { name: ceph04, ip: 10.20.2.14, labels: [osd, mds] }
+
+# --- Base service pools / filesystem ----------------------------------------
+rbd_pool_name: rbd
+rbd_pool_pg_num: 32
+cephfs_volume: cephfs
+
+# --- Storage tiers (phase 06_storage_tiers) ---------------------------------
+hdd_disk_type: st1
+hdd_disk_gb: 500
+hdd_device: /dev/sdd
+tier_pg_num: 32
+rbd_hdd_pool: rbd-hdd
+cephfs_hdd_data_pool: "cephfs.{{ cephfs_volume }}.data.hdd"
+rgw_hdd_data_pool: default.rgw.buckets.data.hdd
+rgw_hdd_storage_class: HDD
+
+# --- HA endpoints: NFS + RGW behind internal AWS NLBs (phase 07_nfs_ha_lb) ---
+nfs_ha_hosts: [ceph03, ceph04]
+nfs_port: 2049
+nfs_nlb_name: ceph9-nfs-nlb
+nfs_nlb_tg_name: ceph9-nfs-tg
+rgw_ha_hosts: [ceph02, ceph03]
+rgw_lb_port: 8080
+rgw_nlb_name: ceph9-rgw-nlb
+rgw_nlb_tg_name: ceph9-rgw-tg
+ceph_nlbs:
+  - { name: "{{ nfs_nlb_name }}", tg: "{{ nfs_nlb_tg_name }}", port: "{{ nfs_port }}",   hosts: "{{ nfs_ha_hosts }}" }
+  - { name: "{{ rgw_nlb_name }}", tg: "{{ rgw_nlb_tg_name }}", port: "{{ rgw_lb_port }}", hosts: "{{ rgw_ha_hosts }}" }

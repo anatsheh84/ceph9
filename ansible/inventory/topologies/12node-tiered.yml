@@ -1,0 +1,111 @@
+---
+# ============================================================================
+# Topology profile: 12node-tiered   (NVMe + SAS + SATA, three CRUSH tiers)
+#
+# Selected by `ceph_topology: 12node-tiered`. Every play loads this via
+# vars_files. Shared vars (region, network, creds, base ports) stay in
+# group_vars/all.yml.
+#
+# 12 nodes = 4 NVMe + 4 SAS + 4 SATA. ONE data disk per node. Three CRUSH
+# device classes (nvme/sas/sata), each backed by a different EBS type since AWS
+# has no literal SAS/SATA media: gp3 -> nvme, st1 -> sas, sc1 -> sata. The class
+# is a logical CRUSH label set at OSD-creation time (see ceph_cluster).
+#
+# Client-side LB for RGW and NFS is AWS NLB, configured OUTSIDE this repo. There
+# is NO cephadm `ingress` service. The playbook only makes the daemons listen on
+# well-known per-host ports (RGW :8080 + :8081, NFS :2049) for NLB target groups.
+#
+# NOTE: IPs/hostnames below are PLACEHOLDERS in the existing 10.20.2.x style.
+# ============================================================================
+
+# Single host that runs `cephadm bootstrap` + all `ceph orch` commands. The
+# Ceph `_admin` LABEL is applied to all three MON hosts (nvme01/sas01/sata01)
+# separately, via each node's labels list.
+ceph_bootstrap_node: nvme01
+
+# --- Single explicit OSD data disk per host ---------------------------------
+# In-guest device as seen on Nitro instances (one attached EBS data volume).
+# Must NOT use --all-available-devices and must NOT scan for spare volumes.
+osd_data_device: /dev/nvme1n1
+# AWS block-device name used at attach time (Nitro remaps it to nvme1n1).
+osd_aws_device_name: /dev/sdb
+
+# CRUSH rule that all CephFS metadata pools and all non-data RGW pools pin to,
+# regardless of the data tier.
+tiered_meta_crush_rule: rule-nvme
+
+# --- Tier definitions (keyed by tier name for O(1) lookup) ------------------
+# device_class : CRUSH class set on each OSD at creation
+# osd_volume_type/size : EBS type+GiB for that tier's single data disk
+# instance_type : AWS instance per tier (PLACEHOLDER — size for real workload)
+# crush_rule / rbd_pool / fs_name / rgw_* : per-tier Ceph objects
+ceph_tier_order: [nvme, sas, sata]
+ceph_tiers:
+  nvme:
+    device_class: nvme
+    crush_rule: rule-nvme
+    osd_volume_type: gp3
+    osd_volume_size: 500
+    instance_type: m5.2xlarge
+    rbd_pool: rbd-nvme
+    fs_name: cephfs-nvme
+    rgw_storage_class: STANDARD_NVME
+    rgw_data_pool: default.rgw.buckets.data.nvme
+  sas:
+    device_class: sas
+    crush_rule: rule-sas
+    osd_volume_type: st1
+    osd_volume_size: 500
+    instance_type: m5.2xlarge
+    rbd_pool: rbd-sas
+    fs_name: cephfs-sas
+    rgw_storage_class: STANDARD_SAS
+    rgw_data_pool: default.rgw.buckets.data.sas
+  sata:
+    device_class: sata
+    crush_rule: rule-sata
+    osd_volume_type: sc1
+    osd_volume_size: 500
+    instance_type: m5.2xlarge
+    rbd_pool: rbd-sata
+    fs_name: cephfs-sata
+    rgw_storage_class: STANDARD_SATA
+    rgw_data_pool: default.rgw.buckets.data.sata
+
+# --- Per-tier shared knobs --------------------------------------------------
+tier_pg_num: 32                 # PGs for each replicated pool (small-lab default)
+rgw_count_per_host: 2           # 2 RGW daemons per rgw-labelled host
+rgw_realm: ceph9                # single realm / zonegroup / zone
+rgw_zonegroup: ceph9-zg
+rgw_zone: ceph9-zone
+
+# --- Nodes (12). For each tier nodes 01-04 carry the daemons below ----------
+#   01: _admin MON MGR MDS(active)     OSD      (nvme01 = bootstrap host)
+#   02: RGW(x2)                        OSD      (+ grafana on nvme02 only)
+#   03: NFS MDS(standby-replay)        OSD
+#   04: NFS RGW(x2)                    OSD
+# `tier` keys into ceph_tiers above (device class, EBS type, pools, fs, ...).
+ceph_nodes:
+  # ---- NVMe tier (gp3) ----
+  - { name: nvme01, ip: 10.20.2.11, tier: nvme, labels: [_admin, mon, mgr, mds, osd] }
+  - { name: nvme02, ip: 10.20.2.12, tier: nvme, labels: [rgw, osd, grafana] }
+  - { name: nvme03, ip: 10.20.2.13, tier: nvme, labels: [nfs, mds, osd] }
+  - { name: nvme04, ip: 10.20.2.14, tier: nvme, labels: [nfs, rgw, osd] }
+  # ---- SAS tier (st1) ----
+  - { name: sas01,  ip: 10.20.2.15, tier: sas,  labels: [_admin, mon, mgr, mds, osd] }
+  - { name: sas02,  ip: 10.20.2.16, tier: sas,  labels: [rgw, osd] }
+  - { name: sas03,  ip: 10.20.2.17, tier: sas,  labels: [nfs, mds, osd] }
+  - { name: sas04,  ip: 10.20.2.18, tier: sas,  labels: [nfs, rgw, osd] }
+  # ---- SATA tier (sc1) ----
+  - { name: sata01, ip: 10.20.2.19, tier: sata, labels: [_admin, mon, mgr, mds, osd] }
+  - { name: sata02, ip: 10.20.2.20, tier: sata, labels: [rgw, osd] }
+  - { name: sata03, ip: 10.20.2.21, tier: sata, labels: [nfs, mds, osd] }
+  - { name: sata04, ip: 10.20.2.22, tier: sata, labels: [nfs, rgw, osd] }
+
+# --- NFS: one cluster, three exports (one per CephFS filesystem) -------------
+nfs_cluster_name: nfslab
+nfs_port: 2049
+nfs_exports:
+  - { pseudo: /cephfs-nvme, fs_name: cephfs-nvme }
+  - { pseudo: /cephfs-sas,  fs_name: cephfs-sas }
+  - { pseudo: /cephfs-sata, fs_name: cephfs-sata }

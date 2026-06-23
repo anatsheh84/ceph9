@@ -8,6 +8,13 @@
 #  Optional extra-vars:  admin_cidr, route53_zone_id, route53_domain
 # ============================================================
 
+# --- Topology selection -------------------------------------------------
+# Which cluster topology to build. Set interactively by ./provision.sh, or
+# pass `-e ceph_topology=<name>`. The value names a profile under
+# inventory/topologies/<name>.yml that every play loads (wired in the next
+# commit). The default reproduces the original 4-node two-tier cluster.
+ceph_topology: "4node-twotier"
+
 # --- AWS / region -------------------------------------------------------
 aws_region: "{{ lookup('env','AWS_DEFAULT_REGION') | default('us-east-2', true) }}"
 aws_availability_zone: "{{ aws_region }}a"
