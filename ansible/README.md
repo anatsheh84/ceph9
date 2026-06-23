@@ -5,6 +5,14 @@ Idempotent Ansible automation for the architecture validated in
 RHEL 9 instances behind a bastion, with RBD, CephFS, S3 (RGW) and NFS
 endpoints.
 
+## Topologies (4-node or 12-node)
+
+This automation builds two selectable cluster shapes. Run `./provision.sh` for an
+interactive menu, or pass `-e ceph_topology=4node-twotier|12node-tiered`. See
+[`docs/topologies.md`](../docs/topologies.md) for the side-by-side comparison,
+per-tier AWS sizing, the single-disk-per-host constraint, and the AWS NLB
+front-end story. Profiles live in [`inventory/topologies/`](inventory/topologies/).
+
 ## What it builds
 
 ```
