@@ -44,4 +44,4 @@ IPs and hostnames in `12node-tiered.yml` are placeholders following the existing
 `10.20.2.x` convention. The `nvme/sas/sata` tiers are **logical CRUSH device
 classes** (AWS has no SAS/SATA media); they are backed by `gp3/st1/sc1` EBS
 respectively and the class is set explicitly at OSD creation. To change the
-single-disk-per-host assumption later, see `docs/topologies.md`.
+single-disk-per-host assumption later, see the repo [`README.md`](../../../README.md).

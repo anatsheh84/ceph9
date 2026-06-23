@@ -1,122 +1,108 @@
-# Ceph 9 on AWS — final handoff
+# ceph9 — engineering handover
 
-**Status: FINALIZED.** Three clean ansible-driven builds completed end-to-end
-on the validated architecture in `setup.md`. The automation under `ansible/`
-is the canonical way to provision the lab.
+Maintainer / Claude-Code handover. The user-facing guide is [`README.md`](README.md);
+this file is the "what's the state, what's tricky, what to know next" companion.
 
-## What was delivered
+## Current status
 
-| | |
-|---|---|
-| `setup.md` | Manually validated deployment guide. Unchanged. |
-| `ansible/` | 8 playbooks · 9 roles · syntax-clean · idempotent. End-to-end build in ~30–45 min. |
-| `ansible/bin/ceph9-access` | Local-laptop helper that prints creds + opens SSH tunnels to dashboard / Grafana / S3 / NFS. |
-| `ansible/README.md` | Three-step user docs (set env → run ansible → run `ceph9-access`). |
+- **Two selectable topologies**, chosen by the global `ceph_topology` var (default
+  `4node-twotier`): `4node-twotier` (4 nodes, ssd/hdd) and `12node-tiered`
+  (12 nodes, nvme/sas/sata). Picker: `ansible/provision.sh`.
+- **`4node-twotier`** — finalized; built clean end-to-end 3× (table below).
+- **`12node-tiered`** — implemented on branch **`12-node-cluster`** (pushed to
+  `origin`, **no PR yet** — review locally first). Built + validated end-to-end
+  on a blank AWS account (`failed=0`, `validate.yml` all green).
+- **Docs consolidated:** `README.md` is now self-contained (the old
+  `ansible/README.md`, `docs/topologies.md`, and `setup.md` were folded in and
+  removed). This `HANDOFF.md` stays separate.
 
-## Three-step usage
+## How it's structured (mechanism a future session must know)
 
-```bash
-# 1. Set environment
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_DEFAULT_REGION=us-east-2
-export RH_USER='you@example.com'
-export RH_PASS='...'
-# optional
-export ADMIN_CIDR="$(curl -s checkip.amazonaws.com)/32"
-export ROUTE53_ZONE_ID=Z3OMFIUXX3RAEI
-export ROUTE53_DOMAIN=sandbox1580.opentlc.com
+- **Topology profiles:** `ansible/inventory/topologies/<name>.yml` hold all
+  topology-specific vars (`ceph_nodes`, tiers, pools, …). `group_vars/all.yml`
+  holds only shared vars + the `ceph_topology` default. Every play loads the
+  selected profile via `vars_files: …/topologies/{{ ceph_topology }}.yml`.
+- **`hosts.yml` is a group-only skeleton** (no concrete hosts). `aws_infra`
+  `add_host`s real nodes at runtime, so 4-node (`ceph01-04`) and 12-node
+  (`nvme/sas/sata01-04`) names never collide. The Ansible `admin` group = the
+  single `ceph_bootstrap_node`; the Ceph `_admin` *label* is applied separately
+  to all MON hosts.
+- **`ceph_services`** dispatches: `base_services.yml` (4-node, original logic) vs
+  `tiered.yml` → `tiered_{crush_pools,cephfs,rgw,nfs}.yml` (12-node).
+- **OSDs:** 4-node uses `--all-available-devices`; 12-node applies one cephadm
+  drivegroup spec per tier with `crush_device_class` at creation, matching the
+  single data disk **by size** (Nitro-safe).
+- For 12-node, `site.yml` skips phases 05/06/07 (smoke + 4-node NLB/tier logic);
+  everything is built in phase 04. Verify with `playbooks/validate.yml`.
 
-# 2. Build with Ansible (≈ 30–45 min)
-cd ansible
-ansible-galaxy collection install -r requirements.yml   # one-time
-ansible-playbook playbooks/site.yml
+## 12-node validation evidence (blank AWS account, end-to-end)
 
-# 3. Open access from your laptop (prints creds, opens tunnels, foreground)
-./bin/ceph9-access
+`site.yml` → all 13 hosts `failed=0`. `validate.yml` → `VALIDATE_EXIT=0`:
+
+```
+health=HEALTH_OK  mon=3  mgr=3 (1 active + 2 standby)  osd=12 (4 per class)
+cephfs=3 (each + standby-replay)  rgw=12 across 6 hosts  nfs=6
+_admin on 3 MON hosts  per-tier pools -> correct rules  meta + rgw-system on rule-nvme
 ```
 
-Then open `https://localhost:8443/` in your browser. Dashboard credentials are
-printed by the script just above the tunnel-ready line.
+Two real bugs were found *because* we test-deployed, and fixed in-code:
+1. **AWS Nitro NVMe naming is non-deterministic** — the data disk isn't always
+   `/dev/nvme1n1` (on some hosts it's `nvme0n1`, root on `nvme1n1`). The OSD spec
+   now matches the data disk **by size** (≥ 80% of tier size), not by path.
+2. **RGW system pools are created lazily** — `control/meta/log` appear after the
+   first pin pass. A final retried re-pin guarantees all non-data RGW pools land
+   on `rule-nvme`. (Also: `validate.yml` counts MGRs via `ceph mgr dump`, not
+   `ceph mgr stat` which has no standbys list.)
 
-## Build results
+## 4-node build history (finalized)
 
-| | BUILD #1 | BUILD #2 | BUILD #3 (final) |
+| | BUILD #1 | BUILD #2 | BUILD #3 |
 |---|---|---|---|
-| Start | clean (tagged) AWS account | clean teardown of #1 | clean teardown of #2 |
 | Wall-clock | ~55 min (incl. fix loop) | ~95 min (transient preflight hang) | ~30 min |
-| `failed=0` everywhere | ✅ | ✅ | ✅ |
-| HEALTH_OK after build | ✅ | ✅ | ✅ |
-| `RBD/CephFS/NFS/S3` smoke | ✅ | ✅ | ✅ |
-| `ceph9-access --info` | n/a | n/a | ✅ prints creds |
-| Dashboard via tunnel | manual ssh -L | manual ssh -L | `ceph9-access` → HTTP 200 |
+| `failed=0` / HEALTH_OK | ✅ | ✅ | ✅ |
+| RBD/CephFS/NFS/S3 smoke | ✅ | ✅ | ✅ |
 
-**Final cluster (live now):**
+Bugs found and fixed during BUILD #1 (baked into roles): comma in `Labels` tag
+(switched to `|`); `ProxyJump` ignoring `-o` (explicit `ProxyCommand`); Jinja in a
+python heredoc (`{% raw %}`); `cephadm` not on `command:` PATH (absolute
+`/usr/sbin/cephadm`); preflight running as root with no key (`become: false`);
+`command:` splitting `--placement="… …"` (switched to `shell:`). Full list of
+baked-in lessons is in the README.
 
-```
-cluster:
-  id:     4fcbf51c-4f9f-11f1-9714-02ece24acab7
-  health: HEALTH_OK
-  mon: 3 daemons, quorum ceph01,ceph02,ceph03
-  mgr: ceph01.sliawp(active), standbys: ceph02.brcpra
-  mds: 1/1 daemons up, 1 standby
-  osd: 8 osds: 8 up, 8 in
-  rgw: 2 daemons active
-data:
-  pools: 11 pools, 625 pgs   (all active+clean)
-  usage: 237 MiB used, 3.9 TiB / 3.9 TiB avail
-```
+## Operational notes for the next session
 
-Bastion `18.218.25.156` is up. Tear down with
-`ansible-playbook playbooks/99_destroy.yml` when finished.
-
-## Bugs found and fixed during BUILD #1 (baked into the roles)
-
-1. **`Labels` instance tag with commas** in value broke AWS CLI shorthand. Switched separator to `|` in `aws_infra`.
-2. **`ProxyJump` implicit ssh ignores `-o StrictHostKeyChecking`**. Replaced with explicit `ProxyCommand` (`aws_infra` and `bin/ceph9-access`).
-3. **Jinja in python heredoc gets templated by Ansible**. Wrapped the `cephadm-preflight.yml` patch in `{% raw %}/{% endraw %}` in `cephadm_preflight/tasks/main.yml`.
-4. **`cephadm` not in `command:` module PATH**. Switched all `cephadm`/`cephadm shell` calls to absolute `/usr/sbin/cephadm`.
-5. **`Run cephadm-preflight playbook` ran as root, root has no SSH key**. Added `become: false` so it runs as ec2-user whose key was created by `ssh_trust`.
-6. **`command:` splits `--placement="label:rgw count-per-host:1"`** at the space. Switched the RGW apply task to `shell:`.
-
-## Issues found during the final validation build
-
-1. **AWS public IP rotation** — the controller's public IP changed between sessions; the SG ingress was opened to the *first* IP. Re-running with the new `ADMIN_CIDR` resolved it. Worth documenting in README that any controller-side IP change requires either a teardown+rebuild or a manual SG patch.
-2. **Preflight inner playbook hang after package install** — the cephadm-ansible 5.0.2 preflight sometimes stalls in its post-install "checks.yml" phase. The outer `failed_when` already tolerates the well-known `infra_pkgs` failure, and a kill-and-continue path works; observed in BUILD #2 but did NOT recur in BUILD #3.
-
-Neither blocked the final build.
-
-## Operational notes
-
-* The cluster placement group keeps the 4 OSD VMs on the same low-latency rack — needed to meet the doc's 10 Gb/s recommendation.
-* `cephadm-preflight` is the slowest step (5–15 min). Be patient.
-* The first dashboard login forces a password change. The script prints the bootstrap password; rotate after first login.
-* AWS sandbox creds shared during this session are still live. **Rotate them.**
+- **cephadm-preflight is the slowest step** (5–15 min); wrapped in `timeout 900`,
+  rc-124 tolerated — a hang can't stall the build.
+- **12 nodes share one bastion** → `wait_for_connection` hits sshd MaxStartups and
+  connects via retries (slow, not stuck). Not a failure.
+- **Dashboard password:** set `CEPH_DASHBOARD_PASSWORD`; `bin/ceph9-access`
+  verifies the live password and caches it at `~/.ceph9-dashboard-pw`.
+- **Never commit secrets.** `env.sh`, `*.pem`, `.provisioned.json`, `clusters/`,
+  `*.log`, and `*.external-details.json` are gitignored; everything reads creds
+  from env vars. Any AWS/RH/GitHub creds shared in a session should be rotated.
+- **AWS controller IP rotation** can leave the SG opened to a stale `ADMIN_CIDR`;
+  re-run with the new CIDR or set `ADMIN_CIDR=0.0.0.0/0` for throwaway sandboxes.
 
 ## File map
 
 ```
 ceph9/
-├── setup.md                          # manual guide (truth source)
+├── README.md                         # self-contained user guide
 ├── HANDOFF.md                        # this file
+├── ocp-odf/                          # companion: OpenShift + ODF + storage portal
 └── ansible/
-    ├── README.md                     # user-facing docs + env-var contract
-    ├── ansible.cfg
-    ├── requirements.yml
-    ├── bin/
-    │   └── ceph9-access              # post-build laptop helper
+    ├── provision.sh                  # interactive topology picker
+    ├── ansible.cfg · requirements.yml
+    ├── bin/ceph9-access              # post-build laptop helper (verifies dash pw)
     ├── inventory/
-    │   ├── hosts.yml                 # short-name skeleton
-    │   └── group_vars/all.yml        # all knobs — no secrets
+    │   ├── hosts.yml                 # group-only skeleton (runtime add_host)
+    │   ├── group_vars/all.yml        # shared knobs + ceph_topology default
+    │   └── topologies/{4node-twotier,12node-tiered}.yml + README.md
     ├── playbooks/
-    │   ├── 00_provision_aws.yml      # aws_infra
-    │   ├── 01_prepare_hosts.yml      # rhel_prep + ssh_trust + cephadm_preflight
-    │   ├── 02_bootstrap.yml          # cephadm_bootstrap
-    │   ├── 03_cluster.yml            # ceph_cluster (host add, labels, OSDs)
-    │   ├── 04_services.yml           # ceph_services (RBD, CephFS, RGW, NFS)
-    │   ├── 05_smoke.yml              # smoke_tests
-    │   ├── 99_destroy.yml            # aws_teardown
-    │   └── site.yml                  # 00..05 imported in order
-    └── roles/{aws_infra,rhel_prep,ssh_trust,cephadm_preflight,
-               cephadm_bootstrap,ceph_cluster,ceph_services,smoke_tests,aws_teardown}/
+    │   ├── 00..05 · 06_storage_tiers · 07_nfs_ha_lb   # 4-node uses 00-07
+    │   ├── validate.yml              # 12-node assertions
+    │   ├── 99_destroy.yml · site.yml # site.yml: 12-node runs 00-04, skips 05-07
+    └── roles/{aws_infra,rhel_prep,ssh_trust,cephadm_preflight,cephadm_bootstrap,
+               ceph_cluster(+templates/osd-spec.yml.j2),
+               ceph_services(+tiered_*.yml),smoke_tests,aws_teardown}/
 ```
