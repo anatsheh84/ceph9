@@ -15,6 +15,17 @@
   when: "'admin' in group_names"
   block:
 
+    # cephadm's default mon/mgr specs (count 5 / 2) auto-deploy onto new hosts as
+    # soon as they're added, then our label:mon / label:mgr pin removes the
+    # extras — leaving stray daemon state that trips HEALTH_WARN. Freeze
+    # placement BEFORE adding hosts so only the labelled hosts ever get a
+    # mon/mgr; the pin tasks below re-manage with the correct placement.
+    - name: Freeze mon/mgr auto-placement before adding hosts
+      ansible.builtin.shell: |
+        /usr/sbin/cephadm shell -- ceph orch apply mon --unmanaged=true
+        /usr/sbin/cephadm shell -- ceph orch apply mgr --unmanaged=true
+      changed_when: false
+
     - name: Add ceph02-04 to the cluster
       ansible.builtin.command:
         cmd: /usr/sbin/cephadm shell -- ceph orch host add {{ item.name }} {{ item.ip }}
