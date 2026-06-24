@@ -70,8 +70,12 @@
 # in case a pool is still appearing.
 - name: Re-pin all RGW system pools to nvme (catch lazily-created control/meta/log)
   ansible.builtin.shell: |
-    cephadm shell -- ceph osd pool ls 2>/dev/null | grep '\.rgw\.' | grep -vE '\.(nvme|sas|sata)$' \
-      | while read -r p; do cephadm shell -- ceph osd pool set "$p" crush_rule {{ tiered_meta_crush_rule }} >/dev/null; done
+    # NB: use `for p in $(...)`, not `... | while read p`, because the cephadm
+    # shell in the loop body would consume the piped pool list on stdin and stop
+    # the loop after the first pool (leaving control/meta unpinned).
+    for p in $(cephadm shell -- ceph osd pool ls 2>/dev/null | grep '\.rgw\.' | grep -vE '\.(nvme|sas|sata)$'); do
+      cephadm shell -- ceph osd pool set "$p" crush_rule {{ tiered_meta_crush_rule }} >/dev/null
+    done
     # report any still not on the meta rule
     BAD=0
     for p in $(cephadm shell -- ceph osd pool ls 2>/dev/null | grep '\.rgw\.' | grep -vE '\.(nvme|sas|sata)$'); do
